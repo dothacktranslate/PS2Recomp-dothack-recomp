@@ -534,6 +534,9 @@ namespace ps2_stubs
             uint64_t cdStreamBytesDemuxed = 0u;
             bool cdStreamEofPending = false;
             bool currentCdStreamEofSeen = false;
+            std::vector<uint8_t> cdStreamStagedBytes;       // host-fed ES held before a decoder exists
+            uint64_t cdStreamStageGeneration = 0u;          // generation the stage belongs to
+            bool cdStreamStageOverflowed = false;           // cap hit -> stage abandoned this generation
             uint32_t feedEsTraceCount = 0u;
             uint32_t demuxPssTraceCount = 0u;
             uint32_t demuxRingTraceCount = 0u;
@@ -1431,7 +1434,8 @@ namespace ps2_stubs
                             const uint8_t *data,
                             size_t size,
                             uint32_t guestAddr,
-                            std::vector<MpegStreamCallbackEvent> &callbackEvents)
+                            std::vector<MpegStreamCallbackEvent> &callbackEvents,
+                            bool trackGuestAddrs = true)
         {
             if (!data || size == 0)
             {
@@ -1461,10 +1465,13 @@ namespace ps2_stubs
             playback.sawInput = true;
 
             playback.pssBuffer.insert(playback.pssBuffer.end(), data, data + size);
-            playback.pssGuestAddrs.reserve(playback.pssGuestAddrs.size() + size);
-            for (size_t i = 0; i < size; ++i)
+            if (trackGuestAddrs)
             {
-                playback.pssGuestAddrs.push_back(guestAddr + static_cast<uint32_t>(i));
+                playback.pssGuestAddrs.reserve(playback.pssGuestAddrs.size() + size);
+                for (size_t i = 0; i < size; ++i)
+                {
+                    playback.pssGuestAddrs.push_back(guestAddr + static_cast<uint32_t>(i));
+                }
             }
             processPssBuffer(mpegAddr, playback, callbackEvents);
         }
@@ -1751,6 +1758,9 @@ namespace ps2_stubs
             g_mpeg_stub_state.cdStreamBytesDemuxed = 0u;
             g_mpeg_stub_state.cdStreamEofPending = false;
             g_mpeg_stub_state.currentCdStreamEofSeen = false;
+            g_mpeg_stub_state.cdStreamStagedBytes.clear();
+            g_mpeg_stub_state.cdStreamStageGeneration = 0u;
+            g_mpeg_stub_state.cdStreamStageOverflowed = false;
             g_mpeg_stub_state.feedEsTraceCount = 0u;
             g_mpeg_stub_state.demuxPssTraceCount = 0u;
             g_mpeg_stub_state.demuxRingTraceCount = 0u;
@@ -1793,6 +1803,8 @@ namespace ps2_stubs
         g_mpeg_stub_state.cdStreamBytesDemuxed = 0u;
         g_mpeg_stub_state.cdStreamEofPending = false;
         g_mpeg_stub_state.currentCdStreamEofSeen = false;
+        g_mpeg_stub_state.cdStreamStagedBytes.clear();
+        g_mpeg_stub_state.cdStreamStageOverflowed = false;
         g_mpeg_stub_state.feedEsTraceCount = 0u;
         g_mpeg_stub_state.demuxPssTraceCount = 0u;
         g_mpeg_stub_state.demuxRingTraceCount = 0u;
@@ -1810,7 +1822,7 @@ namespace ps2_stubs
         });
     }
 
-    void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream)
+        void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream)
     {
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.cdStreamBytesProduced += byteCount;
@@ -1824,8 +1836,15 @@ namespace ps2_stubs
     {
         std::vector<uint32_t> completedMpegIds;
         bool changed = false;
-        {
+                {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+
+            // PR #178 host-fed stream state.
+            g_mpeg_stub_state.currentCdStreamEofSeen = true;
+            g_mpeg_stub_state.cdStreamStagedBytes.clear();
+            g_mpeg_stub_state.cdStreamStageOverflowed = false;
+
+            // Preserve the newer runtime-aware EOF handling from our branch.
             finalizeCdStreamEofUnlocked(completedMpegIds, changed);
         }
 
@@ -1847,6 +1866,68 @@ namespace ps2_stubs
                 runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
             }
         }
+    }
+
+    size_t feedMpegCdStreamBytes(const uint8_t *data, size_t size)
+    {
+        if (!data || size == 0u)
+        {
+            return 0u;
+        }
+
+        size_t routedCount = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+
+            // Active only between notifyMpegCdStreamStart() and notifyMpegCdStreamEof().
+            const bool cdStreamActive =
+                g_mpeg_stub_state.cdStreamGeneration != 0u &&
+                !g_mpeg_stub_state.currentCdStreamEofSeen;
+            if (!cdStreamActive)
+            {
+                return 0u;
+            }
+
+            // Host-fed data carries no guest addresses, so no callback event is queued.
+            // TODO(host-feed callbacks): queue on MpegPlaybackState for a guest syscall to drain.
+            std::vector<MpegStreamCallbackEvent> callbackEvents;
+            for (auto &[mpegAddr, playback] : g_mpeg_stub_state.playbackByMpeg)
+            {
+                if (playback.cdStreamGeneration != g_mpeg_stub_state.cdStreamGeneration)
+                {
+                    continue;
+                }
+                appendPssBytes(mpegAddr, playback, data, size, 0u, callbackEvents, false);
+                ++routedCount;
+            }
+
+            // No decoder on the current generation took these bytes: stage them until the
+            // first sceMpegCreate on this generation; afterwards feed routes live.
+            if (routedCount == 0u && !g_mpeg_stub_state.cdStreamStageOverflowed)
+            {
+                if (g_mpeg_stub_state.cdStreamStageGeneration != g_mpeg_stub_state.cdStreamGeneration)
+                {
+                    g_mpeg_stub_state.cdStreamStagedBytes.clear();
+                    g_mpeg_stub_state.cdStreamStageGeneration = g_mpeg_stub_state.cdStreamGeneration;
+                }
+
+                if (g_mpeg_stub_state.cdStreamStagedBytes.size() + size > kMpegHostFeedStageCapBytes)
+                {
+                    // Dropping the tail would hand a later decoder a gapped stream (staged
+                    // prefix, then a hole, then live feed); discard the whole stage instead
+                    // and let the next decoder resync cleanly on live feed.
+                    g_mpeg_stub_state.cdStreamStagedBytes.clear();
+                    g_mpeg_stub_state.cdStreamStageOverflowed = true;
+                }
+                else
+                {
+                    g_mpeg_stub_state.cdStreamStagedBytes.insert(
+                        g_mpeg_stub_state.cdStreamStagedBytes.end(), data, data + size);
+                }
+            }
+        }
+        g_mpeg_cv.notify_all();
+        return size;
     }
 
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2000,7 +2081,19 @@ namespace ps2_stubs
 
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
-            getPlaybackState(param_1) = makeFreshPlaybackState();
+            auto &pb = getPlaybackState(param_1);
+            pb = makeFreshPlaybackState();
+            if (!g_mpeg_stub_state.cdStreamStageOverflowed &&
+                !g_mpeg_stub_state.cdStreamStagedBytes.empty() &&
+                g_mpeg_stub_state.cdStreamStageGeneration == pb.cdStreamGeneration)
+            {
+                std::vector<MpegStreamCallbackEvent> replayEvents; // host feed: none consumed
+                appendPssBytes(param_1, pb,
+                               g_mpeg_stub_state.cdStreamStagedBytes.data(),
+                               g_mpeg_stub_state.cdStreamStagedBytes.size(),
+                               0u, replayEvents, /*trackGuestAddrs=*/false);
+                g_mpeg_stub_state.cdStreamStagedBytes.clear();
+            }
         }
 
         const uint32_t puVar4 = uVar3 + 0x108u;
