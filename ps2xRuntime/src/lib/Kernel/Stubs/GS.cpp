@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
+#include <cstdio>
 
 namespace ps2_stubs
 {
@@ -959,6 +960,24 @@ namespace ps2_stubs
         const uint32_t ztest = trailing.arg0;
         const uint32_t zpsm = trailing.arg1;
         const uint32_t clear = trailing.arg2;
+
+        std::fprintf(
+    stderr,
+    "[sceGsSetDefDBuff] env=%08x psm=%u w=%u h=%u "
+    "ztest=%u zpsm=%u clear=%u "
+    "t0=%08x t1=%08x t2=%08x\n",
+    envAddr,
+    psm,
+    w,
+    h,
+    ztest,
+    zpsm,
+    clear,
+    getRegU32(ctx, 8),
+    getRegU32(ctx, 9),
+    getRegU32(ctx, 10)
+);
+
         (void)clear;
 
         if (w == 0u)

@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "LibC.h"
 #include "ps2_log.h"
+#include <cstdio>
 
 namespace ps2_stubs
 {
@@ -51,6 +52,12 @@ namespace ps2_stubs
     {
         const uint32_t size = getRegU32(ctx, 4); // $a0
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
+        std::fprintf(
+    stderr,
+    "[malloc] size=0x%08x -> guest=0x%08x\n",
+    size,
+    guestAddr
+);
         setReturnU32(ctx, guestAddr);
     }
 

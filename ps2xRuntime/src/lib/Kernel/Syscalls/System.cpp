@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "System.h"
+#include <cstdio>
 
 namespace ps2_syscalls
 {
@@ -562,7 +563,7 @@ namespace ps2_syscalls
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FF8000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
@@ -579,6 +580,17 @@ namespace ps2_syscalls
         if (runtime)
         {
             runtime->configureGuestHeap(heapBase, heapLimit);
+            std::fprintf(
+    stderr,
+    "[SetupHeap] rawBase=0x%08x alignedBase=0x%08x size=0x%08x "
+    "runtimeBase=0x%08x runtimeEnd=0x%08x runtimeLimit=0x%08x\n",
+    heapBaseRaw,
+    heapBase,
+    heapSize,
+    runtime->guestHeapBase(),
+    runtime->guestHeapEnd(),
+    runtime->guestHeapLimit()
+);
 
             PS2_IF_AGRESSIVE_LOGS({
                 std::cerr << "[SetupHeap]"
@@ -602,7 +614,7 @@ namespace ps2_syscalls
     {
         (void)rdram;
 
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FF8000u;
 
         const uint32_t ret = runtime
                                  ? runtime->guestHeapLimit()
