@@ -261,6 +261,8 @@ struct JumpTable
 class PS2Memory
 {
 public:
+    void raiseIntcStat(uint32_t cause);
+
     PS2Memory();
     ~PS2Memory();
 

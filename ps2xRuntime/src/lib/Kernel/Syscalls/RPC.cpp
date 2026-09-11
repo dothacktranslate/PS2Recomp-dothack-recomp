@@ -537,6 +537,108 @@ namespace ps2_syscalls
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
 
+// Temporary .hack//INFECTION compatibility:
+//
+// The game's overlay loader issues:
+//
+//     sceDevctl("cdrom...", CDIOC_TRYCNT, &retryCount, 1, nullptr, 0);
+//
+// immediately before reading DEMO.PRG.
+//
+// CDIOC_TRYCNT (0x4382) only configures the physical CD/DVD driver's
+// retry count. Host-backed file access does not need this setting.
+//
+// Return a rejected/unsupported response rather than leaving stale data
+// in the receive buffer. The original sceDevctl then returns an error
+// without waiting on its asynchronous completion semaphore. mwBload()
+// intentionally ignores this particular devctl result and continues
+// with sceRead().
+if (!iopResult.handled &&
+    sid == 0x80000001u &&
+    rpcNum == 0x17u &&
+    sendBuf != 0u &&
+    sendSize >= 0x810u &&
+    receiveBuffer != 0u &&
+    receiveSize >= 4u)
+{
+    const uint8_t *send =
+        reinterpret_cast<const uint8_t *>(getMemPtr(rdram, sendBuf));
+
+    uint8_t *recv =
+        reinterpret_cast<uint8_t *>(getMemPtr(rdram, receiveBuffer));
+
+    if (send != nullptr && recv != nullptr)
+    {
+        // sceDevctl packet:
+        //   +0x40C = input data
+        //   +0x80C = devctl command
+        uint32_t command = 0;
+        std::memcpy(&command, send + 0x80Cu, sizeof(command));
+
+        if (command == 0x4382u)
+        {
+            const uint8_t retryCount = send[0x40Cu];
+
+            // Zero means the IOP did not accept/start the operation.
+            // This avoids the guest waiting for an async completion
+            // callback which does not exist in the HLE runtime.
+            const uint32_t result = 0;
+            std::memcpy(recv, &result, sizeof(result));
+
+            iopResult.handled = true;
+            iopResult.resultAddress = receiveBuffer;
+
+            std::cerr
+                << "[dothack:cd-trycnt]"
+                << " retries=" << static_cast<unsigned>(retryCount)
+                << " rpc=0x" << std::hex << rpcNum
+                << " recv=0x" << receiveBuffer
+                << std::dec << std::endl;
+        }
+    }
+}
+
+           // Temporary .hack//INFECTION compatibility:
+//
+// SDRDRV load commands 0x9210 (common SE) and 0x9310
+// (sequence/sound-bank load) return a completion token.
+// The EE waits for the request's word at +0x0C to appear
+// as the first word of the receive buffer.
+const bool dothackSoundLoadAck =
+    sid == 0x12346u &&
+    (rpcNum == 0x9210u || rpcNum == 0x9310u);
+
+if (!iopResult.handled &&
+    dothackSoundLoadAck &&
+    sendBuf != 0u &&
+    sendSize >= 0x10u &&
+    receiveBuffer != 0u &&
+    receiveSize >= 4u)
+{
+    const uint8_t *send =
+        reinterpret_cast<const uint8_t *>(getMemPtr(rdram, sendBuf));
+
+    uint8_t *recv =
+        reinterpret_cast<uint8_t *>(getMemPtr(rdram, receiveBuffer));
+
+    if (send != nullptr && recv != nullptr)
+    {
+        uint32_t completion = 0;
+        std::memcpy(&completion, send + 0x0Cu, sizeof(completion));
+        std::memcpy(recv, &completion, sizeof(completion));
+
+        iopResult.handled = true;
+        iopResult.resultAddress = receiveBuffer;
+
+        std::cerr
+            << "[dothack:snd-load-ack]"
+            << " rpc=0x" << std::hex << rpcNum
+            << " completion=0x" << completion
+            << " recv=0x" << receiveBuffer
+            << std::dec << std::endl;
+    }
+}
+
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
             {

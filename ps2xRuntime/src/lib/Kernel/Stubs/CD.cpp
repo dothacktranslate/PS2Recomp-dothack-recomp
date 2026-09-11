@@ -947,7 +947,85 @@ namespace ps2_stubs
 
         notifyMpegCdStreamStart(runtime);
 
-        std::cerr << "[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
+// .hack//INFECTION diagnostic:
+// The opening movie is streamed by the IOP on real hardware, so the EE never
+// calls sceCdStRead() for it. When the active registered CD file is a PSS,
+// feed its program-stream bytes directly into the host MPEG bridge.
+{
+    const CdDebugSnapshot snapshot = getCdDebugSnapshot();
+
+    for (const CdDebugFileEntry &file : snapshot.files)
+    {
+        const uint64_t fileEndLbn =
+            static_cast<uint64_t>(file.baseLbn) +
+            static_cast<uint64_t>(file.sectors);
+
+        if (static_cast<uint64_t>(lbn) < file.baseLbn ||
+            static_cast<uint64_t>(lbn) >= fileEndLbn)
+        {
+            continue;
+        }
+
+        const std::string extension = file.hostPath.extension().string();
+        if (extension != ".PSS" && extension != ".pss")
+        {
+            continue;
+        }
+
+        const uint64_t sectorOffset =
+            static_cast<uint64_t>(lbn - file.baseLbn);
+
+        const uint64_t byteOffset =
+            sectorOffset * static_cast<uint64_t>(kCdSectorSize);
+
+        if (byteOffset >= file.sizeBytes)
+        {
+            break;
+        }
+
+        const size_t byteCount =
+            static_cast<size_t>(
+                static_cast<uint64_t>(file.sizeBytes) - byteOffset);
+
+        const uint32_t sectorCount =
+            static_cast<uint32_t>(
+                (byteCount + kCdSectorSize - 1u) / kCdSectorSize);
+
+        std::vector<uint8_t> pssBytes(byteCount);
+
+        if (!readCdSectors(
+                lbn,
+                sectorCount,
+                pssBytes.data(),
+                pssBytes.size()))
+        {
+            std::cerr
+                << "[dothack:mpeg-host-feed]"
+                << " failed to read PSS"
+                << " path=\"" << file.hostPath.string() << "\""
+                << std::endl;
+            break;
+        }
+
+        const size_t accepted =
+            feedMpegCdStreamBytes(
+                pssBytes.data(),
+                pssBytes.size());
+
+        std::cerr
+            << "[dothack:mpeg-host-feed]"
+            << " path=\"" << file.hostPath.string() << "\""
+            << " offset=0x" << std::hex << byteOffset
+            << " bytes=0x" << byteCount
+            << " accepted=0x" << accepted
+            << std::dec
+            << std::endl;
+
+        break;
+    }
+}
+
+std::cerr << "[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
                   << " endLbn=0x" << g_cdStreamingEndLbn << std::dec
                   << " rate=" << g_cdStreamTiming.sectorsPerSecond << " sectors/s"
                   << " buffer=" << g_cdStreamTiming.capacitySectors << " sectors"

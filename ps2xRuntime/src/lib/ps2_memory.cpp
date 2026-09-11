@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 namespace
 {
@@ -1103,6 +1104,36 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    // INTC_STAT (0x1000F000) is a write-one-to-clear status register.
+    // Software acknowledges an asserted interrupt by writing a 1 to its bit.
+    if (address == 0x1000F000u)
+    {
+        static unsigned long long dothackBoot78IntcAckTrace = 0ull;
+
+        const uint32_t before =
+            m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+
+        const uint32_t after = before & ~value;
+
+        m_ioRegisters[address] = after;
+
+        if (dothackBoot78IntcAckTrace < 32ull)
+        {
+            ++dothackBoot78IntcAckTrace;
+
+            std::fprintf(
+                stderr,
+                "[dothack:intc-w1c] n=%llu write=0x%08x before=0x%08x after=0x%08x\n",
+                dothackBoot78IntcAckTrace,
+                value,
+                before,
+                after);
+            std::fflush(stderr);
+        }
+
+        return true;
+    }
+
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1271,6 +1302,89 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         {
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
+            
+if (address == 0x10009000u)
+{
+    static uint32_t vif1StartCount = 0;
+    ++vif1StartCount;
+
+    const uint32_t tadr = m_ioRegisters[0x10009030u];
+
+    // Log the first few starts, then periodically so we can see
+    // whether the game's VIF1 chain changes later during boot.
+    const bool shouldLog =
+        vif1StartCount <= 10u ||
+        (vif1StartCount % 120u) == 0u;
+
+    if (shouldLog)
+    {
+        const uint32_t dctrl =
+            (dctrlIt == m_ioRegisters.end()) ? 0xFFFFFFFFu : dctrlIt->second;
+
+        RUNTIME_LOG(
+            "[vif1:dma-start]"
+            << " n=" << std::dec << vif1StartCount
+            << " chcr=0x" << std::hex << value
+            << " dctrl=0x" << dctrl
+            << " madr=0x" << m_ioRegisters[0x10009010u]
+            << " qwc=0x" << m_ioRegisters[0x10009020u]
+            << " tadr=0x" << tadr
+            << " enabled=" << std::dec << (dmacEnabled ? 1 : 0)
+            << std::endl);
+
+        try
+        {
+            const bool scratch = isScratchpad(tadr);
+            const uint32_t phys = translateAddress(tadr);
+
+            const uint8_t *base =
+                scratch ? m_scratchpad : m_rdram;
+
+            const uint32_t limit =
+                scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+
+            if (base != nullptr &&
+                phys < limit &&
+                64u <= (limit - phys))
+            {
+                std::fprintf(
+                    stderr,
+                    "[vif1:head] n=%u tadr=0x%08x",
+                    vif1StartCount,
+                    tadr);
+
+                for (uint32_t i = 0; i < 64u; ++i)
+                {
+                    std::fprintf(
+                        stderr,
+                        " %02x",
+                        static_cast<unsigned>(base[phys + i]));
+                }
+
+                std::fprintf(stderr, "\n");
+            }
+            else
+            {
+                std::fprintf(
+                    stderr,
+                    "[vif1:head] n=%u invalid tadr=0x%08x phys=0x%08x\n",
+                    vif1StartCount,
+                    tadr,
+                    phys);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            std::fprintf(
+                stderr,
+                "[vif1:head] n=%u translate failed tadr=0x%08x: %s\n",
+                vif1StartCount,
+                tadr,
+                e.what());
+        }
+    }
+}
+                
             if (!dmacEnabled)
             {
                 return true;
@@ -1400,6 +1514,30 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 
+                        if (channelBase == 0x10009000u)
+{
+    static uint32_t vif1TagLogCount = 0;
+
+    if (vif1TagLogCount < 12u)
+    {
+        uint64_t tagHigh = 0;
+        std::memcpy(&tagHigh, tp + 8, sizeof(tagHigh));
+
+        RUNTIME_LOG(
+            "[vif1:tag]"
+            << " at=0x" << std::hex << currentTagAddr
+            << " low=0x" << tag
+            << " high=0x" << tagHigh
+            << " id=" << std::dec << id
+            << " qwc=" << tagQwc
+            << " addr=0x" << std::hex << addr
+            << std::dec
+            << std::endl);
+
+        ++vif1TagLogCount;
+    }
+}
+
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
                         bool endChain = false;
@@ -1508,6 +1646,55 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
+
+if (channelBase == 0x10009000u)
+{
+    static uint32_t vif1ChainLogCount = 0;
+
+    if (vif1ChainLogCount < 4u)
+    {
+        RUNTIME_LOG(
+            "[vif1:chain]"
+            << " bytes=" << chainBuf.size()
+            << " tags=" << tagsProcessed
+            << std::endl);
+
+        ++vif1ChainLogCount;
+    }
+}
+
+if (channelBase == 0x10009000u)
+{
+    static uint32_t vif1ChainHashCount = 0;
+    ++vif1ChainHashCount;
+
+    const bool shouldLog =
+        vif1ChainHashCount <= 10u ||
+        (vif1ChainHashCount % 120u) == 0u;
+
+    if (shouldLog)
+    {
+        // 64-bit FNV-1a hash of the exact VIF stream that will
+        // be handed to processVIF1Data().
+        uint64_t hash = 14695981039346656037ull;
+
+        for (uint8_t byte : chainBuf)
+        {
+            hash ^= static_cast<uint64_t>(byte);
+            hash *= 1099511628211ull;
+        }
+
+        RUNTIME_LOG(
+            "[vif1:chain-hash]"
+            << " n=" << std::dec << vif1ChainHashCount
+            << " bytes=" << chainBuf.size()
+            << " tags=" << tagsProcessed
+            << " fnv1a=0x" << std::hex << hash
+            << std::dec
+            << std::endl);
+    }
+}
+
 
                     if (!chainBuf.empty())
                     {
@@ -2166,6 +2353,40 @@ int PS2Memory::pollDmaRegisters()
 {
     return 0;
 }
+
+void PS2Memory::raiseIntcStat(uint32_t cause)
+{
+    if (cause >= 32u)
+    {
+        return;
+    }
+
+    static unsigned long long dothackBoot78IntcRaiseTrace = 0ull;
+
+    constexpr uint32_t INTC_STAT = 0x1000F000u;
+
+    const uint32_t before =
+        m_ioRegisters.count(INTC_STAT) ? m_ioRegisters[INTC_STAT] : 0u;
+
+    const uint32_t after = before | (1u << cause);
+
+    m_ioRegisters[INTC_STAT] = after;
+
+    if (dothackBoot78IntcRaiseTrace < 32ull)
+    {
+        ++dothackBoot78IntcRaiseTrace;
+
+        std::fprintf(
+            stderr,
+            "[dothack:intc-raise] n=%llu cause=%u before=0x%08x after=0x%08x\n",
+            dothackBoot78IntcRaiseTrace,
+            cause,
+            before,
+            after);
+        std::fflush(stderr);
+    }
+}
+
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {

@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "FileIO.h"
+#include "runtime/ee_scheduler.h"
 
 namespace ps2_stubs
 {
@@ -24,9 +25,43 @@ namespace ps2_stubs
     }
 
     void sceFsSigSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    // Temporary .hack//INFECTION compatibility.
+    //
+    // The original _sceFsSigSema simply performs:
+    //
+    //     SignalSema(_fs_semid);
+    //
+    // _fs_semid lives at guest address 0x002F8024.
+    constexpr uint32_t kFsSemIdAddr = 0x002F8024u;
+
+    const uint8_t *semPtr = getConstMemPtr(rdram, kFsSemIdAddr);
+    if (!semPtr)
     {
-        TODO_NAMED("sceFsSigSema", rdram, ctx, runtime);
+        setReturnS32(ctx, -1);
+        return;
     }
+
+    int32_t semId = -1;
+    std::memcpy(&semId, semPtr, sizeof(semId));
+
+    EeScheduler &ee = runtime->eeScheduler();
+    ee.bindMainContextForSyscall(*ctx, rdram);
+
+    const int result =
+        ee.signalSemaphore(semId, false);
+
+    setReturnS32(ctx, result);
+
+    std::fprintf(
+        stderr,
+        "[dothack:sceFsSigSema]"
+        " sem=%d result=%d\n",
+        semId,
+        result);
+
+    ee.transferIfRequested(false);
+}
 
     void close(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {

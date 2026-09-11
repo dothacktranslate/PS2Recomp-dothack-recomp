@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <iostream>
 
 namespace
 {
@@ -420,7 +421,7 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -442,6 +443,20 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
     thread.initialPriority = params.priority;
     thread.currentPriority = params.priority;
     thread.status = EeThreadStatus::Dormant;
+
+    if (params.entry == 0x11A6E0u)
+    {
+        std::cerr
+            << "[dothack:topthread-create]"
+            << " id=" << id
+            << " entry=0x" << std::hex << params.entry << std::dec
+            << " priority=" << params.priority
+            << " stack=0x" << std::hex << params.stack
+            << " stackSize=0x" << params.stackSize
+            << std::dec
+            << std::endl;
+    }
+
     m_threads.emplace(id, std::move(thread));
     publishSnapshot();
     return id;
@@ -499,6 +514,16 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
                                   : getRegU32(&caller, 29);
     SET_GPR_U32(&target->context, 29, stackTop);
     SET_GPR_U32(&target->context, 31, 0u);
+    if (target->entry == 0x11A6E0u)
+    {
+        std::cerr
+            << "[dothack:topthread-start]"
+            << " id=" << target->id
+            << " priority=" << target->currentPriority
+            << " callerThread=" << m_currentThreadId
+            << std::endl;
+    }
+
     enqueueReady(*target);
     requestPreemptionIfHigher(*target, interruptSafe);
     publishSnapshot();
@@ -712,6 +737,18 @@ int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &o
         return KE_UNKNOWN_THID;
     }
     oldPriority = target->currentPriority;
+
+    if (target->id == kMainThreadId && priority == 1)
+    {
+        std::cerr
+            << "[dothack:main-priority-change]"
+            << " id=" << target->id
+            << " old=" << oldPriority
+            << " new=" << priority
+            << " status=" << static_cast<int>(target->status)
+            << std::endl;
+    }
+
     if (target->status == EeThreadStatus::Ready)
     {
         removeReady(*target);
@@ -754,6 +791,40 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
     GuestThread *self = currentThread();
     if (self && self->currentPriority == priority)
     {
+        static uint64_t dothackRotateCycleCount = 0u;
+
+        if (priority == 20 && m_vsyncTick >= 163u)
+        {
+            ++dothackRotateCycleCount;
+
+            const bool dothackTraceThis =
+                dothackRotateCycleCount <= 16u ||
+                (dothackRotateCycleCount % 8192u) == 0u;
+
+            if (dothackTraceThis)
+            {
+                const uint64_t dothackNextEvent =
+                    m_nextDeadlineCycle.load(std::memory_order_acquire);
+
+                const uint64_t dothackCyclesToNext =
+                    dothackNextEvent > m_eeCycle
+                        ? dothackNextEvent - m_eeCycle
+                        : 0u;
+
+                std::cerr
+                    << "[dothack:rotate-cycle]"
+                    << " n=" << dothackRotateCycleCount
+                    << " tick=" << m_vsyncTick
+                    << " thread=" << self->id
+                    << " prio=" << self->currentPriority
+                    << " eeCycle=" << m_eeCycle
+                    << " nextEvent=" << dothackNextEvent
+                    << " toNext=" << dothackCyclesToNext
+                    << " sliceEnd=" << m_sliceEndCycle
+                    << std::endl;
+            }
+        }
+
         enqueueReady(*self);
         m_currentThreadId = 0;
         m_rescheduleRequested = true;
@@ -1168,13 +1239,114 @@ uint32_t EeScheduler::invocationStackTop()
         return existing->second;
     }
     constexpr uint32_t kInvocationStackSize = 0x4000u;
-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
-    if (top == 0u)
+    const uint32_t top =
+        m_runtime.reserveAsyncCallbackStack(
+            kInvocationStackSize,
+            16u
+        );
+
+    if (top != 0u)
     {
-        throw std::runtime_error("EE invocation stack space exhausted");
+        m_invocationStackTops.emplace(key, top);
+        return top;
     }
-    m_invocationStackTops.emplace(key, top);
-    return top;
+
+    /*
+     * Boot 72:
+     *
+     * The runtime's reserved callback-stack arena may be too small
+     * to permanently cache one 0x4000-byte stack for every
+     * (thread, invocation-depth) pair.
+     *
+     * If the arena is full, recycle a cached stack only when the
+     * invocation that used that depth is no longer live.
+     *
+     * A stack cached for depth D is live iff that thread currently
+     * has an invocation at index D:
+     *
+     *     invocations.size() > D
+     *
+     * Otherwise the physical stack storage is idle and can safely
+     * be reassigned to the new key.
+     */
+    for (auto it = m_invocationStackTops.begin();
+         it != m_invocationStackTops.end();
+         ++it)
+    {
+        const uint64_t cachedKey = it->first;
+
+        const int cachedThreadId =
+            static_cast<int>(
+                static_cast<uint32_t>(
+                    cachedKey >> 32u
+                )
+            );
+
+        const size_t cachedDepth =
+            static_cast<size_t>(
+                static_cast<uint32_t>(
+                    cachedKey
+                )
+            );
+
+        GuestThread *cachedOwner =
+            thread(cachedThreadId);
+
+        const bool cachedStackLive =
+            cachedOwner != nullptr &&
+            cachedOwner->invocations.size() > cachedDepth;
+
+        if (cachedStackLive)
+        {
+            continue;
+        }
+
+        const uint32_t reusedTop = it->second;
+
+        const size_t cachedOwnerDepth =
+            cachedOwner != nullptr
+                ? cachedOwner->invocations.size()
+                : 0u;
+
+        std::cerr
+            << "[dothack:invstack-reuse]"
+            << " oldThread=" << cachedThreadId
+            << " oldDepth=" << cachedDepth
+            << " oldLiveDepth=" << cachedOwnerDepth
+            << " newThread=" << owner->id
+            << " newDepth=" << depth
+            << " top=0x"
+            << std::hex << reusedTop
+            << std::dec
+            << " tick=" << m_vsyncTick
+            << " eeCycle=" << m_eeCycle
+            << std::endl;
+
+        m_invocationStackTops.erase(it);
+        m_invocationStackTops.emplace(
+            key,
+            reusedTop
+        );
+
+        return reusedTop;
+    }
+
+    /*
+     * All reserved callback-stack slots are genuinely live.
+     * Preserve the existing failure rather than overlapping stacks.
+     */
+    std::cerr
+        << "[dothack:invstack-reuse-fail]"
+        << " thread=" << owner->id
+        << " depth=" << depth
+        << " cached=" << m_invocationStackTops.size()
+        << " tick=" << m_vsyncTick
+        << " eeCycle=" << m_eeCycle
+        << std::endl;
+
+    throw std::runtime_error(
+        "EE invocation stack space exhausted"
+    );
 }
 
 int EeScheduler::addIrqHandler(bool dmac,
@@ -1252,6 +1424,13 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
+    // Hardware interrupt status is latched independently of whether
+    // software currently allows delivery of the corresponding handler.
+    if (!dmac)
+    {
+        m_runtime.memory().raiseIntcStat(cause);
+    }
+
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {

@@ -768,7 +768,7 @@ namespace ps2recomp
             for (const auto &name : m_config.stubImplementations)
             {
                 const FunctionSelector selector = parseFunctionSelector(name);
-                if (!selector.name.empty())
+                if (!selector.name.empty() && !selector.start.has_value())
                 {
                     m_stubFunctions.insert(selector.name);
                 }
@@ -2021,18 +2021,25 @@ namespace ps2recomp
     }
 
     bool PS2Recompiler::isStubFunction(const Function &function) const
+{
+    if (m_stubFunctionStarts.contains(function.start))
     {
-        if (m_stubFunctionStarts.contains(function.start))
-        {
-            return true;
-        }
-
-        if (m_stubFunctions.contains(function.name))
-        {
-            return true;
-        }
-        return ps2_runtime_calls::isStubName(function.name);
+        return true;
     }
+
+    if (m_stubFunctions.contains(function.name))
+    {
+        return true;
+    }
+
+    // Treat the configured stub list as authoritative.
+    //
+    // A function being known to the runtime does not necessarily mean
+    // that its real implementation inside the guest ELF should be
+    // replaced. If it is not explicitly configured as a stub, allow
+    // the original guest function to be recompiled.
+    return false;
+}
 
     bool PS2Recompiler::IsCorrectnessCriticalFunctionName(const std::string &name)
     {

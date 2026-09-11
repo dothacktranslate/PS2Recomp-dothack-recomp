@@ -1926,7 +1926,7 @@ namespace ps2_stubs
                 }
             }
         }
-        g_mpeg_cv.notify_all();
+
         return size;
     }
 
@@ -2375,6 +2375,24 @@ namespace ps2_stubs
 
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static uint64_t dothackGetPictureCallCount = 0;
+        const uint64_t dothackGetPictureCall = ++dothackGetPictureCallCount;
+
+        if (dothackGetPictureCall <= 64u)
+        {
+            std::cerr
+                << "[dothack:mpeg-getpic-enter]"
+                << " call=" << dothackGetPictureCall
+                << " mpeg=0x" << std::hex << getRegU32(ctx, 4)
+                << " image=0x" << getRegU32(ctx, 5)
+                << std::dec
+                << " tick="
+                << (runtime != nullptr
+                        ? runtime->eeScheduler().currentVSyncTick()
+                        : 0u)
+                << std::endl;
+        }
+
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;
@@ -2393,10 +2411,15 @@ namespace ps2_stubs
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({
-                        std::cerr << "[MPEG:GetPicture] waiting for frames, mpeg=0x" << std::hex << mpegAddr
-                                  << std::dec << " ended=" << playback.streamEnded
-                                  << " failed=" << playback.decoderFailed
-                                  << " sawInput=" << playback.sawInput << std::endl;
+                        std::cerr
+    << "[dothack:mpeg-wait]"
+    << " mpeg=0x" << std::hex << mpegAddr
+    << std::dec
+    << " ended=" << playback.streamEnded
+    << " failed=" << playback.decoderFailed
+    << " sawInput=" << playback.sawInput
+    << " queued=" << playback.decodedFrames.size()
+    << std::endl;
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
@@ -2411,8 +2434,36 @@ namespace ps2_stubs
                         {
                             return;
                         }
+                        if (dothackGetPictureCallCount <= 64u)
+                        {
+                            std::cerr
+                                << "[dothack:mpeg-getpic-resume-1]"
+                                << " tick="
+                                << (runtime != nullptr
+                                        ? runtime->eeScheduler().currentVSyncTick()
+                                        : 0u)
+                                << " v0=" << static_cast<int32_t>(getRegU32(&resumeContext, 2))
+                                << std::endl;
+                        }
                         sceMpegGetPicture(rdram, &resumeContext, runtime);
                     });
+            }
+
+            if (dothackGetPictureCall <= 64u)
+            {
+                std::cerr
+                    << "[dothack:mpeg-getpic-ready]"
+                    << " call=" << dothackGetPictureCall
+                    << " queued=" << playback.decodedFrames.size()
+                    << " served=" << playback.picturesServed
+                    << " streamEnded=" << (playback.streamEnded ? 1 : 0)
+                    << " decoderFailed=" << (playback.decoderFailed ? 1 : 0)
+                    << " sawInput=" << (playback.sawInput ? 1 : 0)
+                    << " tick="
+                    << (runtime != nullptr
+                            ? runtime->eeScheduler().currentVSyncTick()
+                            : 0u)
+                    << std::endl;
             }
 
             if (!playback.decodedFrames.empty())
@@ -2438,6 +2489,17 @@ namespace ps2_stubs
                 {
                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
                     lock.unlock();
+                    if (dothackGetPictureCall <= 64u)
+                    {
+                        std::cerr
+                            << "[dothack:mpeg-getpic-wait-vsync]"
+                            << " call=" << dothackGetPictureCall
+                            << " current=" << currentTick
+                            << " eligible=" << eligibleTick
+                            << " queued=" << playback.decodedFrames.size()
+                            << std::endl;
+                    }
+
                     runtime->eeScheduler().waitVSync(
                         eligibleTick - 1u,
                         -1,
@@ -2446,6 +2508,17 @@ namespace ps2_stubs
                             if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                             {
                                 return;
+                            }
+                            if (dothackGetPictureCallCount <= 64u)
+                            {
+                                std::cerr
+                                    << "[dothack:mpeg-getpic-resume-2]"
+                                    << " tick="
+                                    << (runtime != nullptr
+                                            ? runtime->eeScheduler().currentVSyncTick()
+                                            : 0u)
+                                    << " v0=" << static_cast<int32_t>(getRegU32(&resumeContext, 2))
+                                    << std::endl;
                             }
                             sceMpegGetPicture(rdram, &resumeContext, runtime);
                         });
@@ -2463,16 +2536,20 @@ namespace ps2_stubs
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
                 haveFrame = true;
                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
-                {
-                    PS2_IF_AGRESSIVE_LOGS({
-                        std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
-                                  << std::dec << " generation=" << g_mpeg_stub_state.cdStreamGeneration
-                                  << " frame=" << frameCount
-                                  << " queued=" << playback.decodedFrames.size()
-                                  << " size=" << width << "x" << height << std::endl;
-                    });
-                    ++g_mpeg_stub_state.pictureTraceCount;
-                }
+{
+    std::cerr
+        << "[dothack:mpeg-frame]"
+        << " mpeg=0x" << std::hex << mpegAddr
+        << " image=0x" << imageAddr
+        << std::dec
+        << " generation=" << g_mpeg_stub_state.cdStreamGeneration
+        << " frame=" << frameCount
+        << " queued=" << playback.decodedFrames.size()
+        << " size=" << width << "x" << height
+        << std::endl;
+
+    ++g_mpeg_stub_state.pictureTraceCount;
+}
             }
             else
             {
@@ -2567,14 +2644,17 @@ namespace ps2_stubs
         if (g_mpeg_stub_state.isEndTraceCount < 16u)
         {
             PS2_IF_AGRESSIVE_LOGS({
-                std::cerr << "[MPEG:IsEnd] mpeg=0x" << std::hex << mpegAddr << std::dec
-                          << " ended=" << ended
-                          << " producerEof=" << producerEnded
-                          << " seqEnd=" << playback.sawSequenceEnd
-                          << " streamEnded=" << playback.streamEnded
-                          << " presentationComplete=" << presentationComplete
-                          << " frames=" << playback.decodedFrames.size()
-                          << " sawInput=" << playback.sawInput << std::endl;
+                std::cerr
+    << "[dothack:mpeg-is-end]"
+    << " mpeg=0x" << std::hex << mpegAddr
+    << std::dec
+    << " producerEof=" << producerEnded
+    << " streamEnded=" << playback.streamEnded
+    << " seqEnd=" << playback.sawSequenceEnd
+    << " presentationComplete=" << presentationComplete
+    << " queued=" << playback.decodedFrames.size()
+    << " sawInput=" << playback.sawInput
+    << std::endl;
             });
             ++g_mpeg_stub_state.isEndTraceCount;
         }

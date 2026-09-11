@@ -336,19 +336,29 @@ namespace ps2recomp
             return;
         }
 
-        m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", target);
+            m_ss << fmt::format(" ctx->pc = 0x{:X}u;\n", target);
 
-        if (kind == StaticBranchKind::Call && emitRelocationCallIfAvailable(kind, "    "))
-        {
-            return;
-        }
+    // Prefer a function that is actually present in the recompiled ELF.
+    //
+    // Relocation-symbol runtime binding is useful for external/library
+    // calls, but it must not override a known recompiled function merely
+    // because the relocation name also matches a runtime handler.
+    const bool hasKnownTarget =
+        !m_gen.getFunctionName(target).empty();
 
-        if (emitDirectFunctionJumpIfAvailable(target, kind, "    "))
-        {
-            return;
-        }
+    if (kind == StaticBranchKind::Call &&
+        !hasKnownTarget &&
+        emitRelocationCallIfAvailable(kind, " "))
+    {
+        return;
+    }
 
-        emitExternalJumpDispatch(target, kind, "    ");
+    if (emitDirectFunctionJumpIfAvailable(target, kind, " "))
+    {
+        return;
+    }
+
+    emitExternalJumpDispatch(target, kind, " ");
     }
 
     void ControlFlowEmitter::emitRegisterJump(RegisterBranchKind kind)

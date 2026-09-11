@@ -1,6 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <cstring>
+#include <cstdio>
 
 enum VIFCmd : uint8_t
 {
@@ -277,6 +278,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
 
+static uint32_t vif1CmdLogCount = 0;
+
+if (vif1CmdLogCount < 80u)
+{
+    std::fprintf(
+        stderr,
+        "[vif1:cmd] pos=0x%04x raw=0x%08x opcode=0x%02x num=%u imm=0x%04x\n",
+        pos - 4u,
+        cmd,
+        opcode,
+        num,
+        imm
+    );
+
+    ++vif1CmdLogCount;
+}
+
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
         vif1_regs.num = num;
@@ -340,6 +358,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
+
+std::fprintf(
+    stderr,
+    "[vif1:MSCAL] startPC=0x%04x imm=0x%04x\n",
+    static_cast<unsigned>(imm) * 8u,
+    imm
+);
 
             // Values visible to the VU program for this MSCAL.
             // DobieStation semantics: ITOP = ITOPS; TOP = current TOPS;
