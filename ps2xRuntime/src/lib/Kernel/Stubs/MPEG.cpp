@@ -2659,7 +2659,28 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
+        const bool normalEnd =
+            ended &&
+            playback.decodedFrames.empty() &&
+            presentationComplete;
+
+        // .hack can consume the complete MPEG program while the host CD-stream
+        // EOF bookkeeping still has not asserted producerEnded. Once the PSS
+        // program and MPEG sequence have ended, every decoded picture has been
+        // consumed, and presentation of the final picture is complete, the
+        // decoder itself is authoritative enough to finish the movie.
+        const bool decoderComplete =
+            playback.streamEnded &&
+            playback.sawInput &&
+            playback.sawSequenceEnd &&
+            playback.decodedFrames.empty() &&
+            presentationComplete;
+
+        const bool fallbackEnd =
+            !producerEnded &&
+            decoderComplete;
+
+        setReturnS32(ctx, (normalEnd || fallbackEnd) ? 1 : 0);
     }
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

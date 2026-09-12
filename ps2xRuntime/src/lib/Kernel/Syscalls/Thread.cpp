@@ -122,6 +122,13 @@ namespace ps2_syscalls
                                   bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+
+            // RotateThreadReadyQueue is an active guest yield. Charging no
+            // guest time here allows tight PS2 polling loops, including
+            // .hack's MPEG decoder waits, to execute millions of host-side
+            // scheduler rotations while very little emulated time passes.
+            ee.accountCycles(4096u);
+
             const int result = ee.rotateReadyQueue(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
