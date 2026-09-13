@@ -457,6 +457,20 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
             << std::endl;
     }
 
+    if (id == 29)
+    {
+        std::cerr
+            << "[dothack:boot117-thread29]"
+            << " stage=create"
+            << " id=" << id
+            << " entry=0x" << std::hex << params.entry
+            << " stack=0x" << params.stack
+            << " stackSize=0x" << params.stackSize
+            << std::dec
+            << " priority=" << params.priority
+            << std::endl;
+    }
+
     m_threads.emplace(id, std::move(thread));
     publishSnapshot();
     return id;
@@ -519,6 +533,20 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         std::cerr
             << "[dothack:topthread-start]"
             << " id=" << target->id
+            << " priority=" << target->currentPriority
+            << " callerThread=" << m_currentThreadId
+            << std::endl;
+    }
+
+    if (target->id == 29)
+    {
+        std::cerr
+            << "[dothack:boot117-thread29]"
+            << " stage=start"
+            << " id=" << target->id
+            << " entry=0x" << std::hex << target->entry
+            << " arg=0x" << arg
+            << std::dec
             << " priority=" << target->currentPriority
             << " callerThread=" << m_currentThreadId
             << std::endl;
@@ -1238,7 +1266,16 @@ uint32_t EeScheduler::invocationStackTop()
     {
         return existing->second;
     }
-    constexpr uint32_t kInvocationStackSize = 0x4000u;
+    /*
+     * Boot 160 diagnostic:
+     *
+     * Keep the existing safe 0x01FF8000-0x02000000 callback arena
+     * intact, but use 0x2800-byte invocation stacks.
+     *
+     * Three slots require 0x7800 bytes, leaving 0x800 bytes of
+     * separation above the game's observed main-stack boundary.
+     */
+    constexpr uint32_t kInvocationStackSize = 0x2800u;
     const uint32_t top =
         m_runtime.reserveAsyncCallbackStack(
             kInvocationStackSize,
@@ -1247,6 +1284,19 @@ uint32_t EeScheduler::invocationStackTop()
 
     if (top != 0u)
     {
+        std::cerr
+            << "[dothack:boot160-invstack-new]"
+            << " thread=" << owner->id
+            << " depth=" << depth
+            << " top=0x"
+            << std::hex << top
+            << " slotSize=0x" << kInvocationStackSize
+            << std::dec
+            << " cachedBefore=" << m_invocationStackTops.size()
+            << " tick=" << m_vsyncTick
+            << " eeCycle=" << m_eeCycle
+            << std::endl;
+
         m_invocationStackTops.emplace(key, top);
         return top;
     }

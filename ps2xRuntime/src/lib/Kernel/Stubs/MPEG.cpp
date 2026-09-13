@@ -523,6 +523,11 @@ namespace ps2_stubs
             uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
             uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
             std::vector<MpegRegisteredCallback> callbacks;
+
+            // Host-fed PSS bytes do not have a guest address. Retain the
+            // original payload here until it can be materialized in guest RAM
+            // immediately before dispatching the registered guest callback.
+            std::vector<uint8_t> hostPayload;
         };
 
         struct MpegStubState
@@ -537,6 +542,12 @@ namespace ps2_stubs
             std::vector<uint8_t> cdStreamStagedBytes;       // host-fed ES held before a decoder exists
             uint64_t cdStreamStageGeneration = 0u;          // generation the stage belongs to
             bool cdStreamStageOverflowed = false;           // cap hit -> stage abandoned this generation
+
+            // Complete host-fed stream packets whose callbacks need a real
+            // guest payload address before they can be delivered.
+            std::vector<MpegStreamCallbackEvent> pendingHostCallbackEvents;
+            bool hostCallbackInFlight = false;
+
             uint32_t feedEsTraceCount = 0u;
             uint32_t demuxPssTraceCount = 0u;
             uint32_t demuxRingTraceCount = 0u;
@@ -1175,6 +1186,82 @@ namespace ps2_stubs
             }
         }
 
+        void queueHostStreamCallbackEvent(
+            uint32_t mpegAddr,
+            uint32_t streamType,
+            const uint8_t *data,
+            size_t len,
+            std::vector<MpegStreamCallbackEvent> &callbackEvents,
+            int64_t pts90k = -1,
+            int64_t dts90k = -1)
+        {
+            if (!data || len == 0u)
+            {
+                return;
+            }
+
+            MpegStreamCallbackEvent event{};
+            event.mpegAddr = mpegAddr;
+            event.streamType = streamType;
+            event.dataAddr = 0u;
+            event.len = static_cast<uint32_t>(len);
+            event.pts =
+                pts90k >= 0
+                    ? static_cast<uint64_t>(pts90k)
+                    : 0xFFFFFFFFFFFFFFFFull;
+            event.dts =
+                dts90k >= 0
+                    ? static_cast<uint64_t>(dts90k)
+                    : 0xFFFFFFFFFFFFFFFFull;
+
+            event.hostPayload.assign(data, data + len);
+            callbackEvents.push_back(std::move(event));
+        }
+
+        void drainPendingHostCallbacksUnlocked(
+            uint32_t mpegAddr,
+            std::vector<MpegStreamCallbackEvent> &callbackEvents,
+            size_t maxEvents)
+        {
+            if (maxEvents == 0u)
+            {
+                return;
+            }
+
+            if (g_mpeg_stub_state.hostCallbackInFlight)
+            {
+                return;
+            }
+
+            auto &pending = g_mpeg_stub_state.pendingHostCallbackEvents;
+            size_t emitted = 0u;
+
+            for (auto it = pending.begin();
+                 it != pending.end() && emitted < maxEvents;)
+            {
+                if (it->mpegAddr != mpegAddr)
+                {
+                    ++it;
+                    continue;
+                }
+
+                std::vector<MpegRegisteredCallback> callbacks =
+                    matchingStreamCallbacks(it->mpegAddr, it->streamType);
+
+                // Keep the event pending if registration has not happened yet.
+                if (callbacks.empty())
+                {
+                    ++it;
+                    continue;
+                }
+
+                it->callbacks = std::move(callbacks);
+                callbackEvents.push_back(std::move(*it));
+                it = pending.erase(it);
+                ++emitted;
+            }
+        }
+
         void processPssBuffer(uint32_t mpegAddr,
                               MpegPlaybackState &playback,
                               std::vector<MpegStreamCallbackEvent> &callbackEvents,
@@ -1346,24 +1433,53 @@ namespace ps2_stubs
                 {
                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
                     const size_t payloadStart = pes.payloadOffset;
-                    if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                    if (payloadStart < packetEnd)
                     {
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
+                        const uint32_t payloadLen =
+                            static_cast<uint32_t>(packetEnd - payloadStart);
+
+                        if (payloadStart < playback.pssGuestAddrs.size())
+                        {
+                            // Normal guest-fed path: retain the exact existing
+                            // guest-address callback behavior.
+                            queueStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrPCM,
+                                playback.pssGuestAddrs[payloadStart],
+                                payloadLen,
+                                callbackEvents,
+                                pes.pts90k,
+                                pes.dts90k);
+                            queueStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrADPCM,
+                                playback.pssGuestAddrs[payloadStart],
+                                payloadLen,
+                                callbackEvents,
+                                pes.pts90k,
+                                pes.dts90k);
+                        }
+                        else
+                        {
+                            // Host-fed path: preserve the complete original
+                            // PES payload until a guest address can be supplied.
+                            queueHostStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrPCM,
+                                buffer.data() + payloadStart,
+                                payloadLen,
+                                callbackEvents,
+                                pes.pts90k,
+                                pes.dts90k);
+                            queueHostStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrADPCM,
+                                buffer.data() + payloadStart,
+                                payloadLen,
+                                callbackEvents,
+                                pes.pts90k,
+                                pes.dts90k);
+                        }
                     }
                 }
 
@@ -1597,33 +1713,775 @@ namespace ps2_stubs
                 return;
             }
 
-            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            // BOOT 164: feed the preserved original host PSS PCM payload
+            // directly into the host movie-audio bridge before attempting
+            // guest ReadBuf materialization.
+            //
+            // pcmCallback at 0x40B140 consumes payload+4 / len-4, so mirror
+            // exactly those bytes here.
+            if (callback.func == 0x40B140u &&
+                !event.hostPayload.empty() &&
+                event.hostPayload.size() > 4u)
+            {
+                constexpr uint32_t kBoot164ScratchSize = 0x2000u;
+
+                static uint32_t s_boot164ScratchAddr = 0u;
+                static uint32_t s_boot164FeedCount = 0u;
+                static uint32_t s_boot164FailureCount = 0u;
+
+                const size_t sourceSize =
+                    event.hostPayload.size() - 4u;
+
+                const uint8_t *source =
+                    event.hostPayload.data() + 4u;
+
+                if (sourceSize <=
+                    static_cast<size_t>(kBoot164ScratchSize))
+                {
+                    if (s_boot164ScratchAddr == 0u)
+                    {
+                        s_boot164ScratchAddr =
+                            runtime->guestMalloc(
+                                kBoot164ScratchSize,
+                                16u);
+
+                        std::cerr
+                            << "[dothack:boot164-host-audio]"
+                            << " stage=scratch-alloc"
+                            << " addr=0x" << std::hex
+                            << s_boot164ScratchAddr
+                            << std::dec
+                            << " size=" << kBoot164ScratchSize
+                            << std::endl;
+                    }
+
+                    uint8_t *scratch =
+                        s_boot164ScratchAddr != 0u
+                            ? getMemPtr(
+                                  rdram,
+                                  s_boot164ScratchAddr)
+                            : nullptr;
+
+                    if (scratch)
+                    {
+                        std::memcpy(
+                            scratch,
+                            source,
+                            sourceSize);
+
+                        if (s_boot164FeedCount < 96u)
+                        {
+                            std::cerr
+                                << "[dothack:boot164-host-audio]"
+                                << " stage=feed"
+                                << " n=" << s_boot164FeedCount
+                                << " mpeg=0x" << std::hex
+                                << event.mpegAddr
+                                << " scratch=0x"
+                                << s_boot164ScratchAddr
+                                << std::dec
+                                << " hostLen="
+                                << event.hostPayload.size()
+                                << " pcmLen="
+                                << sourceSize
+                                << " first8="
+                                << std::hex
+                                << static_cast<unsigned>(source[0])
+                                << ","
+                                << static_cast<unsigned>(source[1])
+                                << ","
+                                << static_cast<unsigned>(source[2])
+                                << ","
+                                << static_cast<unsigned>(source[3])
+                                << ","
+                                << static_cast<unsigned>(source[4])
+                                << ","
+                                << static_cast<unsigned>(source[5])
+                                << ","
+                                << static_cast<unsigned>(source[6])
+                                << ","
+                                << static_cast<unsigned>(source[7])
+                                << std::dec
+                                << std::endl;
+                        }
+
+                        ++s_boot164FeedCount;
+
+                        runtime->audioBackend()
+                            .onMoviePcmTransfer(
+                                rdram,
+                                s_boot164ScratchAddr,
+                                static_cast<uint32_t>(
+                                    sourceSize));
+                    }
+                    else if (s_boot164FailureCount < 16u)
+                    {
+                        std::cerr
+                            << "[dothack:boot164-host-audio]"
+                            << " stage=scratch-unavailable"
+                            << " n="
+                            << s_boot164FailureCount++
+                            << " addr=0x" << std::hex
+                            << s_boot164ScratchAddr
+                            << std::dec
+                            << std::endl;
+                    }
+                }
+                else if (s_boot164FailureCount < 16u)
+                {
+                    std::cerr
+                        << "[dothack:boot164-host-audio]"
+                        << " stage=packet-too-large"
+                        << " n="
+                        << s_boot164FailureCount++
+                        << " sourceSize="
+                        << sourceSize
+                        << " scratchSize="
+                        << kBoot164ScratchSize
+                        << std::endl;
+                }
+            }
+
+            MpegStreamCallbackEvent materializedEvent = event;
+            uint32_t callbackUserData = callback.data;
+
+            // BOOT 152:
+            //
+            // Boot 149 proved that a host-fed PCM packet can be copied into
+            // the game's real ReadBuf and successfully delivered through the
+            // genuine pcmCallback at 0x40B140.
+            //
+            // Boot 150 expands that proof only slightly:
+            //
+            //   * at most EIGHT host PCM callbacks may be materialized;
+            //   * each callback must use the game's real ReadBuf;
+            //   * the ring must be completely empty (used == 0);
+            //   * the payload may wrap naturally at the ring boundary;
+            //   * writePos and used are NEVER changed by this experiment;
+            //   * subsequent packets are inspected but not delivered once
+            //     the eight-callback limit has been reached.
+            //
+            // This lets us observe the game's audio state after the first
+            // packet initialized it, without enabling continuous delivery.
+            bool hostPayloadUsesRealReadBuf = false;
+            uint32_t hostPayloadDataAddr = 0u;
+
+            // BOOT 152:
+            // Verify that the temporary source bytes placed in the free
+            // portion of the real ReadBuf survive until the PCM callback
+            // has completely returned.
+            uint32_t boot152ExpectedSourceHash = 0u;
+            uint32_t boot152PayloadLen = 0u;
+            uint32_t boot152WritePos = 0u;
+
+            if (!event.hostPayload.empty())
+            {
+                // BOOT 153:
+                // Extend the proven materialization path to eight callbacks.
+                // No continuous-delivery or AudioDec back-pressure policy is
+                // enabled yet; this remains a bounded diagnostic experiment.
+                static uint32_t s_boot152SuccessfulCallbacks = 0u;
+                static uint32_t s_boot152LogCount = 0u;
+
+                if (callback.data == 0u)
+                {
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=no-userdata"
+                        << " mpeg=0x" << std::hex << event.mpegAddr
+                        << " func=0x" << callback.func
+                        << std::dec
+                        << " len=" << event.hostPayload.size()
+                        << std::endl;
+
+                    return;
+                }
+
+                // This experiment is specifically for the known .hack PCM
+                // callback proven by Boot 149. Do not materialize some other
+                // registered stream callback into the ReadBuf by accident.
+                if (callback.func != 0x40B140u)
+                {
+                    if (s_boot152LogCount < 64u)
+                    {
+                        std::cerr
+                            << "[dothack:boot153-eight-packet]"
+                            << " stage=non-pcm-skip"
+                            << " n=" << s_boot152LogCount++
+                            << " mpeg=0x" << std::hex << event.mpegAddr
+                            << " func=0x" << callback.func
+                            << " type=0x" << event.streamType
+                            << std::dec
+                            << " len=" << event.hostPayload.size()
+                            << std::endl;
+                    }
+
+                    return;
+                }
+
+                uint8_t *realReadBuf =
+                    getMemPtr(rdram, callback.data);
+
+                if (!realReadBuf)
+                {
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=invalid-user-pointer"
+                        << " mpeg=0x" << std::hex << event.mpegAddr
+                        << " user=0x" << callback.data
+                        << std::dec
+                        << " len=" << event.hostPayload.size()
+                        << std::endl;
+
+                    return;
+                }
+
+                const uint32_t writePos =
+                    *reinterpret_cast<const uint32_t *>(
+                        realReadBuf + 0x50000u);
+
+                const uint32_t used =
+                    *reinterpret_cast<const uint32_t *>(
+                        realReadBuf + 0x50004u);
+
+                const uint32_t capacity =
+                    *reinterpret_cast<const uint32_t *>(
+                        realReadBuf + 0x50008u);
+
+                const uint32_t freeBytes =
+                    capacity >= used
+                        ? capacity - used
+                        : 0u;
+
+                if (s_boot152LogCount < 64u)
+                {
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=inspect"
+                        << " n=" << s_boot152LogCount++
+                        << " successes=" << s_boot152SuccessfulCallbacks
+                        << " mpeg=0x" << std::hex << event.mpegAddr
+                        << " type=0x" << event.streamType
+                        << " func=0x" << callback.func
+                        << " user=0x" << callback.data
+                        << std::dec
+                        << " writePos=" << writePos
+                        << " used=" << used
+                        << " capacity=" << capacity
+                        << " free=" << freeBytes
+                        << " hostLen=" << event.hostPayload.size()
+                        << std::endl;
+                }
+
+                if (capacity != 0x50000u ||
+                    writePos >= capacity ||
+                    used > capacity)
+                {
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=invalid-ring-state"
+                        << " mpeg=0x" << std::hex << event.mpegAddr
+                        << " user=0x" << callback.data
+                        << std::dec
+                        << " writePos=" << writePos
+                        << " used=" << used
+                        << " capacity=" << capacity
+                        << std::endl;
+
+                    return;
+                }
+
+                // We inspect later events even after the delivery cap so the
+                // report tells us how the real ReadBuf evolves.
+                if (s_boot152SuccessfulCallbacks >= 8u)
+                {
+                    if (s_boot152LogCount < 64u)
+                    {
+                        std::cerr
+                            << "[dothack:boot153-eight-packet]"
+                            << " stage=eight-packet-cap"
+                            << " n=" << s_boot152LogCount++
+                            << " successes=" << s_boot152SuccessfulCallbacks
+                            << " mpeg=0x" << std::hex << event.mpegAddr
+                            << std::dec
+                            << " writePos=" << writePos
+                            << " used=" << used
+                            << " free=" << freeBytes
+                            << " hostLen=" << event.hostPayload.size()
+                            << std::endl;
+                    }
+
+                    return;
+                }
+
+                // BOOT 152:
+                //
+                // Packets 1 and 2 still arrive while the ring is empty.
+                // Packets 3 through 8 are deliberately allowed to borrow the ring's
+                // currently FREE region beginning at writePos.
+                //
+                // We do NOT advance writePos or used. This is temporary
+                // callback source storage only. The experiment remains
+                // capped at eight callbacks.
+
+                const size_t payloadLen =
+                    event.hostPayload.size();
+
+                if (payloadLen < 4u ||
+                    payloadLen > static_cast<size_t>(capacity))
+                {
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=invalid-payload-size"
+                        << " mpeg=0x" << std::hex << event.mpegAddr
+                        << std::dec
+                        << " len=" << payloadLen
+                        << " capacity=" << capacity
+                        << std::endl;
+
+                    return;
+                }
+
+                if (payloadLen > static_cast<size_t>(freeBytes))
+                {
+                    if (s_boot152LogCount < 64u)
+                    {
+                        std::cerr
+                            << "[dothack:boot153-eight-packet]"
+                            << " stage=insufficient-free-space"
+                            << " n=" << s_boot152LogCount++
+                            << " successes=" << s_boot152SuccessfulCallbacks
+                            << " mpeg=0x" << std::hex << event.mpegAddr
+                            << std::dec
+                            << " writePos=" << writePos
+                            << " used=" << used
+                            << " free=" << freeBytes
+                            << " hostLen=" << payloadLen
+                            << std::endl;
+                    }
+
+                    return;
+                }
+
+                const size_t contiguous =
+                    static_cast<size_t>(capacity - writePos);
+
+                const size_t firstLen =
+                    payloadLen < contiguous
+                        ? payloadLen
+                        : contiguous;
+
+                std::memcpy(
+                    realReadBuf + writePos,
+                    event.hostPayload.data(),
+                    firstLen);
+
+                if (payloadLen > firstLen)
+                {
+                    std::memcpy(
+                        realReadBuf,
+                        event.hostPayload.data() + firstLen,
+                        payloadLen - firstLen);
+                }
+
+                boot152ExpectedSourceHash = 2166136261u;
+
+                for (const uint8_t byte : event.hostPayload)
+                {
+                    boot152ExpectedSourceHash ^= byte;
+                    boot152ExpectedSourceHash *= 16777619u;
+                }
+
+                boot152PayloadLen =
+                    static_cast<uint32_t>(payloadLen);
+
+                boot152WritePos =
+                    writePos;
+
+                hostPayloadDataAddr =
+                    callback.data + writePos;
+
+                materializedEvent.dataAddr =
+                    hostPayloadDataAddr;
+
+                materializedEvent.len =
+                    static_cast<uint32_t>(payloadLen);
+
+                // Keep the game's original callback userdata. This is the
+                // actual ReadBuf whose capacity pcmCallback uses for wrapping.
+                callbackUserData = callback.data;
+
+                hostPayloadUsesRealReadBuf = true;
+
+                ++s_boot152SuccessfulCallbacks;
+
+                std::cerr
+                    << "[dothack:boot153-eight-packet]"
+                    << " stage=materialized"
+                    << " sequence=" << s_boot152SuccessfulCallbacks
+                    << " mpeg=0x" << std::hex << event.mpegAddr
+                    << " func=0x" << callback.func
+                    << " user=0x" << callbackUserData
+                    << " data=0x" << hostPayloadDataAddr
+                    << std::dec
+                    << " len=" << payloadLen
+                    << " firstLen=" << firstLen
+                    << " wrapped=" << (payloadLen > firstLen ? 1 : 0)
+                    << " metadataUnchanged=1"
+                    << std::endl;
+            }
+
+            const uint32_t cbDataAddr =
+                runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+
             if (cbDataAddr == 0u)
             {
+                if (hostPayloadUsesRealReadBuf)
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_mpeg_stub_mutex);
+
+                    g_mpeg_stub_state.hostCallbackInFlight =
+                        false;
+
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=cbdata-alloc-failed"
+                        << " mpeg=0x" << std::hex << event.mpegAddr
+                        << std::dec
+                        << std::endl;
+                }
+
                 return;
             }
-            if (!writeMpegCallbackData(rdram, cbDataAddr, event))
+
+            if (!writeMpegCallbackData(
+                    rdram,
+                    cbDataAddr,
+                    materializedEvent))
             {
                 runtime->guestFree(cbDataAddr);
+
+                std::cerr
+                    << "[dothack:boot153-eight-packet]"
+                    << " stage=write-cbdata-failed"
+                    << " mpeg=0x" << std::hex << event.mpegAddr
+                    << std::dec
+                    << std::endl;
+
                 return;
             }
 
             R5900Context callbackCtx = *callerCtx;
             SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
             SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
-            SET_GPR_U32(&callbackCtx, 6, callback.data);
+            SET_GPR_U32(&callbackCtx, 6, callbackUserData);
             SET_GPR_U32(&callbackCtx, 7, 0u);
             SET_GPR_U32(&callbackCtx, 29, 0u);
             SET_GPR_U32(&callbackCtx, 31, 0u);
             callbackCtx.pc = callback.func;
 
+            // BOOT 151:
+            //
+            // Capture the game's AudioDec pointer before dispatch. The PCM
+            // callback obtains this from gp-0x6D38. We retain only the address
+            // here; the actual state is inspected after the callback returns.
+            uint32_t boot151AudioDecAddr = 0u;
+
+            if (hostPayloadUsesRealReadBuf &&
+                callback.func == 0x40B140u)
+            {
+                const uint32_t callbackGp =
+                    getRegU32(&callbackCtx, 28);
+
+                const uint32_t audioSlotAddr =
+                    callbackGp - 0x6D38u;
+
+                uint8_t *audioSlot =
+                    getMemPtr(rdram, audioSlotAddr);
+
+                if (audioSlot)
+                {
+                    std::memcpy(
+                        &boot151AudioDecAddr,
+                        audioSlot,
+                        sizeof(boot151AudioDecAddr));
+                }
+            }
+
+
             GuestInvocation invocation{};
             invocation.kind = GuestInvocationKind::RpcCallback;
             invocation.context = callbackCtx;
-            invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
+
+            invocation.onComplete =
+                [runtime,
+                 rdram,
+                 cbDataAddr,
+                 hostPayloadUsesRealReadBuf,
+                 hostPayloadDataAddr,
+                 callbackUserData,
+                 boot151AudioDecAddr,
+                 boot152ExpectedSourceHash,
+                 boot152PayloadLen,
+                 boot152WritePos](
+                    const R5900Context &,
+                    R5900Context &)
             {
                 runtime->guestFree(cbDataAddr);
+
+                if (hostPayloadUsesRealReadBuf)
+                {
+                    static uint32_t s_boot151PostCount = 0u;
+
+                    uint32_t ringWritePos = 0u;
+                    uint32_t ringUsed = 0u;
+                    uint32_t ringCapacity = 0u;
+                    bool ringValid = false;
+
+                    uint8_t *realReadBuf =
+                        getMemPtr(rdram, callbackUserData);
+
+                    if (realReadBuf)
+                    {
+                        std::memcpy(
+                            &ringWritePos,
+                            realReadBuf + 0x50000u,
+                            sizeof(ringWritePos));
+
+                        std::memcpy(
+                            &ringUsed,
+                            realReadBuf + 0x50004u,
+                            sizeof(ringUsed));
+
+                        std::memcpy(
+                            &ringCapacity,
+                            realReadBuf + 0x50008u,
+                            sizeof(ringCapacity));
+
+                        ringValid = true;
+                    }
+
+                    int32_t state = -1;
+                    int32_t f2c = -1;
+                    uint32_t f30 = 0u;
+                    int32_t f34 = -1;
+                    int32_t f38 = -1;
+                    int32_t f3c = -1;
+                    uint32_t f44 = 0u;
+                    int32_t f48 = -1;
+                    int32_t f4c = -1;
+                    int32_t f50 = -1;
+                    int32_t f54 = -1;
+                    int32_t f58 = -1;
+                    bool audioValid = false;
+
+                    uint8_t *audioDec = nullptr;
+
+                    if (boot151AudioDecAddr != 0u)
+                    {
+                        audioDec =
+                            getMemPtr(rdram, boot151AudioDecAddr);
+                    }
+
+                    if (audioDec)
+                    {
+                        auto readU32 =
+                            [audioDec](size_t offset)
+                            {
+                                uint32_t value = 0u;
+
+                                std::memcpy(
+                                    &value,
+                                    audioDec + offset,
+                                    sizeof(value));
+
+                                return value;
+                            };
+
+                        state =
+                            static_cast<int32_t>(readU32(0x00u));
+
+                        f2c =
+                            static_cast<int32_t>(readU32(0x2Cu));
+
+                        f30 =
+                            readU32(0x30u);
+
+                        f34 =
+                            static_cast<int32_t>(readU32(0x34u));
+
+                        f38 =
+                            static_cast<int32_t>(readU32(0x38u));
+
+                        f3c =
+                            static_cast<int32_t>(readU32(0x3Cu));
+
+                        f44 =
+                            readU32(0x44u);
+
+                        f48 =
+                            static_cast<int32_t>(readU32(0x48u));
+
+                        f4c =
+                            static_cast<int32_t>(readU32(0x4Cu));
+
+                        f50 =
+                            static_cast<int32_t>(readU32(0x50u));
+
+                        f54 =
+                            static_cast<int32_t>(readU32(0x54u));
+
+                        f58 =
+                            static_cast<int32_t>(readU32(0x58u));
+
+                        audioValid = true;
+                    }
+
+                    uint32_t boot152ObservedSourceHash = 0u;
+                    bool boot152SourceHashValid = false;
+
+                    if (realReadBuf &&
+                        ringCapacity == 0x50000u &&
+                        boot152PayloadLen > 0u &&
+                        boot152PayloadLen <= ringCapacity &&
+                        boot152WritePos < ringCapacity)
+                    {
+                        boot152ObservedSourceHash = 2166136261u;
+
+                        for (uint32_t i = 0u;
+                             i < boot152PayloadLen;
+                             ++i)
+                        {
+                            const uint32_t offset =
+                                static_cast<uint32_t>(
+                                    (static_cast<uint64_t>(
+                                         boot152WritePos) +
+                                     static_cast<uint64_t>(i)) %
+                                    static_cast<uint64_t>(
+                                        ringCapacity));
+
+                            boot152ObservedSourceHash ^=
+                                realReadBuf[offset];
+
+                            boot152ObservedSourceHash *=
+                                16777619u;
+                        }
+
+                        boot152SourceHashValid = true;
+                    }
+
+                    std::cerr
+                        << "[dothack:boot152-source-stability]"
+                        << " user=0x" << std::hex
+                        << callbackUserData
+                        << " data=0x" << hostPayloadDataAddr
+                        << " expected=0x"
+                        << boot152ExpectedSourceHash
+                        << " observed=0x"
+                        << boot152ObservedSourceHash
+                        << std::dec
+                        << " payloadLen="
+                        << boot152PayloadLen
+                        << " writePos="
+                        << boot152WritePos
+                        << " hashValid="
+                        << (boot152SourceHashValid ? 1 : 0)
+                        << " sourceStable="
+                        << (
+                               boot152SourceHashValid &&
+                               boot152ExpectedSourceHash ==
+                                   boot152ObservedSourceHash
+                               ? 1
+                               : 0
+                           )
+                        << " ringWritePos="
+                        << ringWritePos
+                        << " ringUsed="
+                        << ringUsed
+                        << " ringCapacity="
+                        << ringCapacity
+                        << std::endl;
+
+                    std::cerr
+                        << "[dothack:boot151-post-pcm]"
+                        << " n=" << s_boot151PostCount++
+                        << " user=0x" << std::hex
+                        << callbackUserData
+                        << " data=0x" << hostPayloadDataAddr
+                        << " ad=0x" << boot151AudioDecAddr
+                        << std::dec
+                        << " audioValid=" << (audioValid ? 1 : 0)
+                        << " state=" << state
+                        << " f2c=" << f2c
+                        << " f30=0x" << std::hex << f30
+                        << std::dec
+                        << " f34=" << f34
+                        << " f38=" << f38
+                        << " f3c=" << f3c
+                        << " f44=0x" << std::hex << f44
+                        << std::dec
+                        << " f48=" << f48
+                        << " f4c=" << f4c
+                        << " f50=" << f50
+                        << " f54=" << f54
+                        << " f58=" << f58
+                        << " ringValid=" << (ringValid ? 1 : 0)
+                        << " ringWritePos=" << ringWritePos
+                        << " ringUsed=" << ringUsed
+                        << " ringCapacity=" << ringCapacity
+                        << std::endl;
+
+                    std::lock_guard<std::mutex> lock(
+                        g_mpeg_stub_mutex);
+
+                    g_mpeg_stub_state.hostCallbackInFlight =
+                        false;
+
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=complete"
+                        << " data=0x" << std::hex
+                        << hostPayloadDataAddr
+                        << std::dec
+                        << std::endl;
+                }
             };
+
+            if (hostPayloadUsesRealReadBuf)
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_mpeg_stub_mutex);
+
+                if (g_mpeg_stub_state.hostCallbackInFlight)
+                {
+                    runtime->guestFree(cbDataAddr);
+
+                    std::cerr
+                        << "[dothack:boot153-eight-packet]"
+                        << " stage=inflight-race-skip"
+                        << " mpeg=0x" << std::hex
+                        << event.mpegAddr
+                        << std::dec
+                        << std::endl;
+
+                    return;
+                }
+
+                g_mpeg_stub_state.hostCallbackInFlight = true;
+
+                std::cerr
+                    << "[dothack:boot153-eight-packet]"
+                    << " stage=queued"
+                    << " mpeg=0x" << std::hex << event.mpegAddr
+                    << " func=0x" << callback.func
+                    << " user=0x" << callbackUserData
+                    << " data=0x" << hostPayloadDataAddr
+                    << " cbData=0x" << cbDataAddr
+                    << std::dec
+                    << std::endl;
+            }
+
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
@@ -1759,6 +2617,8 @@ namespace ps2_stubs
             g_mpeg_stub_state.cdStreamEofPending = false;
             g_mpeg_stub_state.currentCdStreamEofSeen = false;
             g_mpeg_stub_state.cdStreamStagedBytes.clear();
+            g_mpeg_stub_state.pendingHostCallbackEvents.clear();
+            g_mpeg_stub_state.hostCallbackInFlight = false;
             g_mpeg_stub_state.cdStreamStageGeneration = 0u;
             g_mpeg_stub_state.cdStreamStageOverflowed = false;
             g_mpeg_stub_state.feedEsTraceCount = 0u;
@@ -1804,6 +2664,8 @@ namespace ps2_stubs
         g_mpeg_stub_state.cdStreamEofPending = false;
         g_mpeg_stub_state.currentCdStreamEofSeen = false;
         g_mpeg_stub_state.cdStreamStagedBytes.clear();
+        g_mpeg_stub_state.pendingHostCallbackEvents.clear();
+        g_mpeg_stub_state.hostCallbackInFlight = false;
         g_mpeg_stub_state.cdStreamStageOverflowed = false;
         g_mpeg_stub_state.feedEsTraceCount = 0u;
         g_mpeg_stub_state.demuxPssTraceCount = 0u;
@@ -1899,6 +2761,15 @@ namespace ps2_stubs
                 }
                 appendPssBytes(mpegAddr, playback, data, size, 0u, callbackEvents, false);
                 ++routedCount;
+            }
+
+            for (MpegStreamCallbackEvent &event : callbackEvents)
+            {
+                if (!event.hostPayload.empty())
+                {
+                    g_mpeg_stub_state.pendingHostCallbackEvents.push_back(
+                        std::move(event));
+                }
             }
 
             // No decoder on the current generation took these bytes: stage them until the
@@ -2092,6 +2963,16 @@ namespace ps2_stubs
                                g_mpeg_stub_state.cdStreamStagedBytes.data(),
                                g_mpeg_stub_state.cdStreamStagedBytes.size(),
                                0u, replayEvents, /*trackGuestAddrs=*/false);
+
+                for (MpegStreamCallbackEvent &event : replayEvents)
+                {
+                    if (!event.hostPayload.empty())
+                    {
+                        g_mpeg_stub_state.pendingHostCallbackEvents.push_back(
+                            std::move(event));
+                    }
+                }
+
                 g_mpeg_stub_state.cdStreamStagedBytes.clear();
             }
         }
@@ -2258,6 +3139,119 @@ namespace ps2_stubs
         const uint32_t ringBaseAddr = getRegU32(ctx, 7);
         const uint32_t ringSize = readAbiArg4(rdram, ctx);
 
+        // BOOT 157B: pump one serialized host PCM event from ring demux.
+        //
+        // Boot 155 established that OPENING will not call startDisplay(1)
+        // until AudioDec::audioDecIsPreset() becomes true:
+        //
+        //     AudioDec + 0x54 >= AudioDec + 0x48
+        //
+        // with OPENING's +0x48 preset target equal to 0x6000 bytes.
+        //
+        // Boot 156 showed that suppressing GetPicture is not a sustainable
+        // preroll pump. The guest eventually stops polling GetPicture while
+        // its two-frame VoBuf is full.
+        //
+        // sceMpegDemuxPssRing continues to participate in the producer loop
+        // during that state. At this point the guest producer has already
+        // committed its CD bytes to the real ReadBuf, so the existing
+        // Boot 152/153 materializer can inspect writePos/used and borrow
+        // only the currently FREE region.
+        //
+        // We drain at most ONE event on each entry. hostCallbackInFlight
+        // remains authoritative, so only one real-ReadBuf callback can be
+        // outstanding. The existing eight-success diagnostic cap and FNV
+        // source-stability verification remain unchanged.
+        std::vector<MpegStreamCallbackEvent>
+            boot157bHostCallbackEvents;
+
+        size_t boot157bPendingAfterDrain = 0u;
+        bool boot157bInFlightAfterDrain = false;
+
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+
+            constexpr size_t
+                kDothackHostAudioEventsPerRingDemux = 1u;
+
+            drainPendingHostCallbacksUnlocked(
+                mpegAddr,
+                boot157bHostCallbackEvents,
+                kDothackHostAudioEventsPerRingDemux);
+
+            boot157bPendingAfterDrain =
+                g_mpeg_stub_state.pendingHostCallbackEvents.size();
+
+            boot157bInFlightAfterDrain =
+                g_mpeg_stub_state.hostCallbackInFlight;
+        }
+
+        if (!boot157bHostCallbackEvents.empty())
+        {
+            static uint32_t s_boot157bPumpCount = 0u;
+
+            if (s_boot157bPumpCount < 96u)
+            {
+                std::cerr
+                    << "[dothack:boot157b-ring-pump]"
+                    << " stage=dispatch"
+                    << " n=" << s_boot157bPumpCount++
+                    << " mpeg=0x" << std::hex << mpegAddr
+                    << " data=0x" << dataAddr
+                    << " ringBase=0x" << ringBaseAddr
+                    << std::dec
+                    << " available=" << availableBytes
+                    << " ringSize=" << ringSize
+                    << " events="
+                    << boot157bHostCallbackEvents.size()
+                    << " pending="
+                    << boot157bPendingAfterDrain
+                    << " inFlightBeforeDispatch="
+                    << (boot157bInFlightAfterDrain ? 1 : 0)
+                    << std::endl;
+            }
+
+            dispatchStreamCallbacksUnlocked(
+                rdram,
+                ctx,
+                runtime,
+                boot157bHostCallbackEvents);
+        }
+        else
+        {
+            static uint32_t s_boot157bIdleCount = 0u;
+
+            if (s_boot157bIdleCount < 32u)
+            {
+                bool currentInFlight = false;
+                size_t currentPending = 0u;
+
+                {
+                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+
+                    currentInFlight =
+                        g_mpeg_stub_state.hostCallbackInFlight;
+
+                    currentPending =
+                        g_mpeg_stub_state.pendingHostCallbackEvents.size();
+                }
+
+                if (currentPending != 0u || currentInFlight)
+                {
+                    std::cerr
+                        << "[dothack:boot157b-ring-pump]"
+                        << " stage=idle"
+                        << " n=" << s_boot157bIdleCount++
+                        << " mpeg=0x" << std::hex << mpegAddr
+                        << std::dec
+                        << " pending=" << currentPending
+                        << " inFlight="
+                        << (currentInFlight ? 1 : 0)
+                        << std::endl;
+                }
+            }
+        }
+
         std::vector<MpegStreamCallbackEvent> callbackEvents;
         std::vector<uint32_t> completedMpegIds;
         size_t consumed = 0u;
@@ -2395,6 +3389,54 @@ namespace ps2_stubs
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t imageAddr = getRegU32(ctx, 5);
+
+        // BOOT 165:
+        // Revisit the queued host PCM once per movie presentation cycle.
+        // The initial PSS demux can outrun Raylib's double-buffered stream;
+        // this lets buffers refill after the audio device consumes them.
+        if (runtime != nullptr)
+        {
+            runtime->audioBackend().pumpMovieAudio();
+        }
+
+        std::vector<MpegStreamCallbackEvent> hostCallbackEvents;
+        size_t boot144PendingAfterDrain = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+
+            constexpr size_t kDothackHostAudioEventsPerPicture = 1u;
+            drainPendingHostCallbacksUnlocked(
+                mpegAddr,
+                hostCallbackEvents,
+                kDothackHostAudioEventsPerPicture);
+
+            boot144PendingAfterDrain =
+                g_mpeg_stub_state.pendingHostCallbackEvents.size();
+        }
+
+        if (!hostCallbackEvents.empty())
+        {
+            static uint32_t s_boot144DrainLogCount = 0u;
+            if (s_boot144DrainLogCount < 32u)
+            {
+                std::cerr
+                    << "[dothack:boot144-host-audio]"
+                    << " stage=drain"
+                    << " n=" << s_boot144DrainLogCount++
+                    << " mpeg=0x" << std::hex << mpegAddr
+                    << std::dec
+                    << " events=" << hostCallbackEvents.size()
+                    << " pending=" << boot144PendingAfterDrain
+                    << std::endl;
+            }
+
+            dispatchStreamCallbacksUnlocked(
+                rdram,
+                ctx,
+                runtime,
+                hostCallbackEvents);
+        }
+
         uint32_t width = kStubMovieWidth;
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;

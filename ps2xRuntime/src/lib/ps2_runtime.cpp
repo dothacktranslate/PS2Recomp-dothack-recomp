@@ -1314,11 +1314,44 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
+    const bool dothackBoot105SetDefDBuff =
+        targetPc == 0x10E620u &&
+        sourcePc == 0x10B200u &&
+        fallthroughPc == 0x10B208u;
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    const bool dispatchCheckpointDue =
+        m_eeScheduler &&
+        m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles);
+
+    if (dothackBoot105SetDefDBuff)
     {
+        std::cerr
+            << "[dothack:boot105-dispatch]"
+            << " stage=entry"
+            << " checkpoint=" << (dispatchCheckpointDue ? 1 : 0)
+            << " pc=0x" << std::hex << ctx->pc
+            << " ra=0x" << getRegU32(ctx, 31)
+            << " target=0x" << targetPc
+            << " fallthrough=0x" << fallthroughPc
+            << std::dec
+            << std::endl;
+    }
+
+    if (dispatchCheckpointDue)
+    {
+        if (dothackBoot105SetDefDBuff)
+        {
+            std::cerr
+                << "[dothack:boot105-dispatch]"
+                << " stage=checkpoint-return-false"
+                << " pc=0x" << std::hex << ctx->pc
+                << std::dec
+                << std::endl;
+        }
+
         return false;
     }
 
@@ -1358,17 +1391,66 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
 
+    if (dothackBoot105SetDefDBuff)
+    {
+        std::cerr
+            << "[dothack:boot105-dispatch]"
+            << " stage=after-target"
+            << " pc=0x" << std::hex << ctx->pc
+            << " ra=0x" << getRegU32(ctx, 31)
+            << " entry=0x" << entryPc
+            << " fallthrough=0x" << fallthroughPc
+            << std::dec
+            << " stop=" << (isStopRequested() ? 1 : 0)
+            << std::endl;
+    }
+
     if (isStopRequested() || ctx->pc == 0u)
     {
+        if (dothackBoot105SetDefDBuff)
+        {
+            std::cerr
+                << "[dothack:boot105-dispatch]"
+                << " stage=stop-return-false"
+                << " pc=0x" << std::hex << ctx->pc
+                << std::dec
+                << std::endl;
+        }
+
         return false;
     }
 
     if (ctx->pc == entryPc)
     {
         ctx->pc = fallthroughPc;
+
+        if (dothackBoot105SetDefDBuff)
+        {
+            std::cerr
+                << "[dothack:boot105-dispatch]"
+                << " stage=entrypc-fixup"
+                << " pc=0x" << std::hex << ctx->pc
+                << std::dec
+                << std::endl;
+        }
     }
 
-    return ctx->pc == fallthroughPc;
+    const bool dispatchResult =
+        ctx->pc == fallthroughPc;
+
+    if (dothackBoot105SetDefDBuff)
+    {
+        std::cerr
+            << "[dothack:boot105-dispatch]"
+            << " stage=return"
+            << " result=" << (dispatchResult ? 1 : 0)
+            << " pc=0x" << std::hex << ctx->pc
+            << " expected=0x" << fallthroughPc
+            << std::dec
+            << std::endl;
+    }
+
+    return dispatchResult;
 }
 
 void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)

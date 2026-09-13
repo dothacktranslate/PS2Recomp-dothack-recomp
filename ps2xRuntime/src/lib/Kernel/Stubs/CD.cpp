@@ -983,9 +983,20 @@ namespace ps2_stubs
             break;
         }
 
+        const uint64_t remainingBytes =
+            static_cast<uint64_t>(file.sizeBytes) - byteOffset;
+
+        // .hack//INFECTION: keep the initial host-fed PSS chunk bounded.
+        // Large movies such as OPENING.PSS must be refilled incrementally
+        // rather than decoded from the entire file synchronously here.
+        constexpr uint64_t kDothackInitialPssFeedCapBytes =
+            4ull * 1024ull * 1024ull;
+
         const size_t byteCount =
             static_cast<size_t>(
-                static_cast<uint64_t>(file.sizeBytes) - byteOffset);
+                std::min<uint64_t>(
+                    remainingBytes,
+                    kDothackInitialPssFeedCapBytes));
 
         const uint32_t sectorCount =
             static_cast<uint32_t>(

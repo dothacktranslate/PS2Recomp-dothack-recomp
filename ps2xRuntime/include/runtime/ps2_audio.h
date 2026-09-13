@@ -15,6 +15,18 @@ public:
 
     void onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes);
     void onVagTransferFromBuffer(const uint8_t *data, uint32_t sizeBytes, uint32_t keyAddr);
+
+    // BOOT 162: .hack PSS movie PCM bridge.
+    // Mirrors the movie player's EE->IOP PCM transfer into the
+    // host audio backend without altering guest DMA semantics.
+    void onMoviePcmTransfer(const uint8_t *rdram,
+                            uint32_t srcAddr,
+                            uint32_t sizeBytes);
+
+    // BOOT 165: periodically refill the host PSS AudioStream after
+    // the initial MPEG demux burst has filled the PCM queue.
+    void pumpMovieAudio();
+
     void onSoundCommand(uint32_t sid, uint32_t rpcNum,
                         const uint8_t *sendBuf, uint32_t sendSize,
                         uint8_t *recvBuf, uint32_t recvSize);

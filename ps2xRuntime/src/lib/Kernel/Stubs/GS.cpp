@@ -978,6 +978,16 @@ namespace ps2_stubs
     getRegU32(ctx, 10)
 );
 
+        static uint32_t s_dothackBoot102SetDefDBuffCalls = 0u;
+        const uint32_t dothackBoot102Call =
+            ++s_dothackBoot102SetDefDBuffCalls;
+
+        std::fprintf(
+            stderr,
+            "[dothack:boot102-dbuff] call=%u stage=after-entry-log\n",
+            dothackBoot102Call
+        );
+
         (void)clear;
 
         if (w == 0u)
@@ -1001,11 +1011,25 @@ namespace ps2_stubs
         const int32_t drawHeight = static_cast<int32_t>(h);
 
         uint32_t zbufAddr = 0u;
+
+        std::fprintf(
+            stderr,
+            "[dothack:boot102-dbuff] call=%u stage=before-zbuf\n",
+            dothackBoot102Call
+        );
+
         {
             R5900Context temp = *ctx;
             sceGszbufaddr(rdram, &temp, runtime);
             zbufAddr = getRegU32(&temp, 2);
         }
+
+        std::fprintf(
+            stderr,
+            "[dothack:boot102-dbuff] call=%u stage=after-zbuf zbuf=0x%08x\n",
+            dothackBoot102Call,
+            zbufAddr
+        );
 
         GsDBuffMem db{};
         db.disp[0].pmode = pmode;
@@ -1020,12 +1044,37 @@ namespace ps2_stubs
         db.giftag1 = db.giftag0;
         seedGsDrawEnv1(db.draw1, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
 
+        std::fprintf(
+            stderr,
+            "[dothack:boot102-dbuff] call=%u stage=before-write env=0x%08x\n",
+            dothackBoot102Call,
+            envAddr
+        );
+
         if (!writeGsDBuff(rdram, envAddr, db))
         {
+            std::fprintf(
+                stderr,
+                "[dothack:boot102-dbuff] call=%u stage=write-failed\n",
+                dothackBoot102Call
+            );
             setReturnS32(ctx, -1);
             return;
         }
+
+        std::fprintf(
+            stderr,
+            "[dothack:boot102-dbuff] call=%u stage=after-write\n",
+            dothackBoot102Call
+        );
+
         setReturnS32(ctx, 0);
+
+        std::fprintf(
+            stderr,
+            "[dothack:boot102-dbuff] call=%u stage=return result=0\n",
+            dothackBoot102Call
+        );
     }
 
     void sceGsSetDefDispEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1305,6 +1354,52 @@ namespace ps2_stubs
                 result |= 4;
             if ((mem.readIORegister(0x10003020) & 0xC00) != 0)
                 result |= 0x10;
+
+            // Temporary Boot 100 diagnostic for .hack//Infection's movie
+            // vblank handler. 0x40ADB8 is the return address of its
+            // sceGsSyncPath(1, 0) call.
+            if (ctx != nullptr && ctx->pc == 0x40ADB8u)
+            {
+                static uint32_t s_dothackBoot100Polls = 0u;
+                static uint32_t s_dothackBoot100LastResult = 0xFFFFFFFFu;
+
+                const uint32_t poll = s_dothackBoot100Polls++;
+                const bool changed =
+                    result != s_dothackBoot100LastResult;
+
+                const bool sample =
+                    poll < 8u ||
+                    changed ||
+                    (poll % 30u) == 0u;
+
+                if (sample)
+                {
+                    const uint32_t vif1Chcr =
+                        mem.readIORegister(0x10009000u);
+                    const uint32_t gifChcr =
+                        mem.readIORegister(0x1000A000u);
+                    const uint32_t vif1Stat =
+                        mem.readIORegister(0x10003C00u);
+                    const uint32_t gifStat =
+                        mem.readIORegister(0x10003020u);
+
+                    RUNTIME_LOG(
+                        "[dothack:boot100-syncpath]"
+                        << " n=" << std::dec << poll
+                        << " tick="
+                        << runtime->eeScheduler().currentVSyncTick()
+                        << " changed=" << (changed ? 1 : 0)
+                        << " result=0x" << std::hex << result
+                        << " vif1Chcr=0x" << vif1Chcr
+                        << " gifChcr=0x" << gifChcr
+                        << " vif1Stat=0x" << vif1Stat
+                        << " gifStat=0x" << gifStat
+                        << std::dec
+                    );
+                }
+
+                s_dothackBoot100LastResult = result;
+            }
 
             setReturnS32(ctx, result);
         }
