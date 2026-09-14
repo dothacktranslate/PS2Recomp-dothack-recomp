@@ -47,7 +47,7 @@ static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+static constexpr int HOST_WINDOW_HEIGHT = 480;
 #endif
 struct ElfHeader
 {
@@ -2471,10 +2471,40 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+
+        // BOOT 177A:
+        // Preserve the PS2 guest raster exactly as produced by the GS,
+        // but present it using the intended 4:3 display aspect ratio.
+        //
+        // 640x448 describes the guest framebuffer dimensions, not the
+        // final square-pixel host display dimensions. The full source
+        // image is therefore mapped into a 4:3 destination rectangle.
+        //
+        // Keeping guest rendering and host presentation separate here
+        // also provides a clean foundation for future native, HD and
+        // widescreen display modes.
+        constexpr float kNativeDisplayAspect = 4.0f / 3.0f;
+
+        const float correctedWidth = srcWidth;
+        const float correctedHeight =
+            correctedWidth / kNativeDisplayAspect;
+
+        const float scale =
+            std::min(
+                screenWidth / correctedWidth,
+                screenHeight / correctedHeight);
+
+        const float dstWidth =
+            correctedWidth * scale;
+
+        const float dstHeight =
+            correctedHeight * scale;
+
+        const Rectangle srcRect{
+            0.0f,
+            0.0f,
+            srcWidth,
+            srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
             (screenHeight - dstHeight) * 0.5f,
