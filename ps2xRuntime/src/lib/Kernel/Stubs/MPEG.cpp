@@ -23,6 +23,12 @@ extern "C"
 
 namespace ps2_stubs
 {
+
+    // BOOT 167: CD-side bounded host PSS refill helper.
+    size_t refillDothackHostPssStream(
+        PS2Runtime *runtime,
+        size_t maxBytes);
+
     namespace
     {
         struct MpegDecodedFrame
@@ -512,6 +518,18 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+
+            // BOOT 175:
+            // Host-audio master-clock synchronization state.
+            //
+            // picturesServed counts pictures handed to the guest.
+            // boot175DroppedFrames counts source pictures deliberately
+            // discarded to keep source time aligned with real audio time.
+            bool boot175HostClockArmed = false;
+            double boot175HostClockBaseSeconds = 0.0;
+            uint64_t boot175HostClockBaseSourceProgress = 0u;
+            uint64_t boot175DroppedFrames = 0u;
+            bool boot175FinalSyncLogged = false;
         };
 
         struct MpegStreamCallbackEvent
@@ -1719,7 +1737,11 @@ namespace ps2_stubs
             //
             // pcmCallback at 0x40B140 consumes payload+4 / len-4, so mirror
             // exactly those bytes here.
-            if (callback.func == 0x40B140u &&
+            // BOOT 170: host audio is already mirrored at demux time.
+            // Preserve this older diagnostic bridge for reference, but do
+            // not execute it. Genuine guest PCM callbacks continue below.
+            if (false &&
+                callback.func == 0x40B140u &&
                 !event.hostPayload.empty() &&
                 event.hostPayload.size() > 4u)
             {
@@ -2730,7 +2752,68 @@ namespace ps2_stubs
         }
     }
 
-    size_t feedMpegCdStreamBytes(const uint8_t *data, size_t size)
+    // BOOT 170: mirror unique PCM events in demux order.
+    //
+    // A private PSS audio packet is represented by both PCM and ADPCM
+    // callback events for guest compatibility. Host playback must use
+    // only the PCM copy. Feeding here preserves exact packet order and
+    // prevents the dispatch-time duplicate/rate bottleneck.
+    void feedDothackHostMovieAudioEvents(
+        PS2Runtime *runtime,
+        const std::vector<MpegStreamCallbackEvent> &events,
+        const char *stage)
+    {
+        if (!runtime)
+            return;
+
+        size_t packetCount = 0u;
+        size_t payloadBytes = 0u;
+
+        for (const MpegStreamCallbackEvent &event : events)
+        {
+            if (event.streamType != kMpegStrPCM ||
+                event.hostPayload.size() <= 4u)
+            {
+                continue;
+            }
+
+            const uint8_t *pcm =
+                event.hostPayload.data() + 4u;
+
+            const size_t pcmBytes =
+                event.hostPayload.size() - 4u;
+
+            runtime->audioBackend()
+                .onMoviePcmTransferFromBuffer(
+                    pcm,
+                    static_cast<uint32_t>(pcmBytes));
+
+            ++packetCount;
+            payloadBytes += pcmBytes;
+        }
+
+        if (packetCount != 0u)
+        {
+            static uint32_t s_boot170LogCount = 0u;
+
+            if (s_boot170LogCount < 256u)
+            {
+                std::cerr
+                    << "[dothack:boot170-demux-audio]"
+                    << " n=" << s_boot170LogCount++
+                    << " stage="
+                    << (stage ? stage : "unknown")
+                    << " packets=" << packetCount
+                    << " pcmBytes=" << payloadBytes
+                    << std::endl;
+            }
+        }
+    }
+
+    size_t feedMpegCdStreamBytes(
+        const uint8_t *data,
+        size_t size,
+        PS2Runtime *runtime)
     {
         if (!data || size == 0u)
         {
@@ -2762,6 +2845,12 @@ namespace ps2_stubs
                 appendPssBytes(mpegAddr, playback, data, size, 0u, callbackEvents, false);
                 ++routedCount;
             }
+
+            // BOOT 170: feed live host PCM events before guest queuing.
+            feedDothackHostMovieAudioEvents(
+                runtime,
+                callbackEvents,
+                "live-refill");
 
             for (MpegStreamCallbackEvent &event : callbackEvents)
             {
@@ -2963,6 +3052,12 @@ namespace ps2_stubs
                                g_mpeg_stub_state.cdStreamStagedBytes.data(),
                                g_mpeg_stub_state.cdStreamStagedBytes.size(),
                                0u, replayEvents, /*trackGuestAddrs=*/false);
+
+                // BOOT 170: feed staged startup PCM in demux order.
+                feedDothackHostMovieAudioEvents(
+                    runtime,
+                    replayEvents,
+                    "staged-startup");
 
                 for (MpegStreamCallbackEvent &event : replayEvents)
                 {
@@ -3399,6 +3494,113 @@ namespace ps2_stubs
             runtime->audioBackend().pumpMovieAudio();
         }
 
+        // BOOT 175:
+        // Sample the exact Boot 172 soundtrack clock before entering
+        // the MPEG mutex. A negative value means no host PSS soundtrack
+        // has started, so silent/logo movies retain the old behavior.
+        const double boot175MovieAudioSeconds =
+            runtime != nullptr
+                ? runtime->audioBackend().movieAudioElapsedSeconds()
+                : -1.0;
+
+        // BOOT 167: low/high-water OPENING refill.
+        //
+        // The 4 MiB startup feed produces roughly 147 decoded OPENING
+        // pictures.  Do not keep appending the entire movie.  Instead,
+        // when presentation drains the live queue to <= 96 pictures,
+        // append one 512 KiB chunk.  A chunk of this size has historically
+        // represented roughly 18-20 movie pictures, keeping the queue
+        // bounded around a few seconds of video.
+        //
+        // Critically, inspect the queue under the MPEG lock but perform
+        // the CD read/feed only AFTER releasing it: feedMpegCdStreamBytes()
+        // acquires the same MPEG mutex internally.
+        constexpr size_t kBoot167RefillLowWaterFrames = 112u;
+        constexpr size_t kBoot167RefillChunkBytes =
+            1024u * 1024u;
+
+        bool boot167ShouldRefill = false;
+        size_t boot167QueueBefore = 0u;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_mpeg_stub_mutex);
+
+            const auto playbackIt =
+                g_mpeg_stub_state.playbackByMpeg.find(
+                    mpegAddr);
+
+            if (playbackIt !=
+                g_mpeg_stub_state.playbackByMpeg.end())
+            {
+                const MpegPlaybackState &playback =
+                    playbackIt->second;
+
+                boot167QueueBefore =
+                    playback.decodedFrames.size();
+
+                boot167ShouldRefill =
+                    playback.cdStreamGeneration ==
+                        g_mpeg_stub_state.cdStreamGeneration &&
+                    !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                    playback.sawInput &&
+                    boot167QueueBefore <=
+                        kBoot167RefillLowWaterFrames;
+            }
+        }
+
+        if (runtime != nullptr &&
+            boot167ShouldRefill)
+        {
+            const size_t accepted =
+                refillDothackHostPssStream(
+                    runtime,
+                    kBoot167RefillChunkBytes);
+
+            if (accepted != 0u)
+            {
+                static uint32_t
+                    s_boot167GetPictureRefillCount = 0u;
+
+                if (s_boot167GetPictureRefillCount < 256u)
+                {
+                    size_t queueAfter = 0u;
+
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_mpeg_stub_mutex);
+
+                        const auto playbackIt =
+                            g_mpeg_stub_state.playbackByMpeg.find(
+                                mpegAddr);
+
+                        if (playbackIt !=
+                            g_mpeg_stub_state.playbackByMpeg.end())
+                        {
+                            queueAfter =
+                                playbackIt->second
+                                    .decodedFrames.size();
+                        }
+                    }
+
+                    std::cerr
+                        << "[dothack:boot167-getpic-refill]"
+                        << " n="
+                        << s_boot167GetPictureRefillCount++
+                        << " mpeg=0x"
+                        << std::hex << mpegAddr
+                        << std::dec
+                        << " queueBefore="
+                        << boot167QueueBefore
+                        << " accepted="
+                        << accepted
+                        << " queueAfter="
+                        << queueAfter
+                        << std::endl;
+                }
+            }
+        }
+
         std::vector<MpegStreamCallbackEvent> hostCallbackEvents;
         size_t boot144PendingAfterDrain = 0u;
         {
@@ -3513,7 +3715,7 @@ namespace ps2_stubs
                 const uint64_t currentTick = runtime->eeScheduler().currentVSyncTick();
                 const uint64_t currentTickQ32 = currentTick << 32u;
                 const MpegDecodedFrame &nextFrame = playback.decodedFrames.front();
-                const uint64_t frameIntervalQ32 = decodedFrameIntervalQ32(playback, nextFrame);
+                uint64_t frameIntervalQ32 = decodedFrameIntervalQ32(playback, nextFrame);
                 uint64_t presentationTargetQ32 = presentationTickForFrame(playback, nextFrame, currentTickQ32);
 
                 if (currentTickQ32 > presentationTargetQ32 && currentTickQ32 - presentationTargetQ32 >= frameIntervalQ32)
@@ -3566,6 +3768,154 @@ namespace ps2_stubs
                         });
                 }
 
+                // BOOT 175:
+                // Keep the source-video timeline aligned with the host
+                // soundtrack without changing either audio rate or the
+                // guest's VBlank cadence.
+                //
+                // At each presentation opportunity, determine where the
+                // source-video producer should be according to elapsed
+                // real audio time. If normal presentation of this frame
+                // would still leave us one or more COMPLETE source frames
+                // behind, discard only those late source pictures.
+                //
+                // This is standard late-frame recovery: presentation
+                // cadence stays continuous, while source content catches
+                // up to the audio master clock.
+                if (playback.boot175HostClockArmed &&
+                    boot175MovieAudioSeconds >=
+                        playback.boot175HostClockBaseSeconds &&
+                    playback.decodedFrames.size() > 1u)
+                {
+                    const uint64_t nominalIntervalQ32 =
+                        playback.pictureIntervalQ32 != 0u
+                            ? playback.pictureIntervalQ32
+                            : kDefaultPictureIntervalQ32;
+
+                    const double frameSeconds =
+                        (static_cast<double>(nominalIntervalQ32) /
+                         static_cast<double>(kPictureClockOne)) *
+                        (1001.0 / 60000.0);
+
+                    if (frameSeconds > 0.0)
+                    {
+                        const double audioProgressSeconds =
+                            boot175MovieAudioSeconds -
+                            playback.boot175HostClockBaseSeconds;
+
+                        const uint64_t expectedAdvance =
+                            static_cast<uint64_t>(
+                                audioProgressSeconds /
+                                frameSeconds);
+
+                        const uint64_t expectedSourceProgress =
+                            playback.boot175HostClockBaseSourceProgress +
+                            expectedAdvance;
+
+                        const uint64_t currentSourceProgress =
+                            static_cast<uint64_t>(
+                                playback.picturesServed) +
+                            playback.boot175DroppedFrames;
+
+                        // One picture will be presented normally below.
+                        const uint64_t sourceProgressAfterNormalFrame =
+                            currentSourceProgress + 1u;
+
+                        if (expectedSourceProgress >
+                            sourceProgressAfterNormalFrame)
+                        {
+                            const uint64_t wantedDrops =
+                                expectedSourceProgress -
+                                sourceProgressAfterNormalFrame;
+
+                            const uint64_t availableDrops =
+                                static_cast<uint64_t>(
+                                    playback.decodedFrames.size() - 1u);
+
+                            const uint64_t dropCount =
+                                std::min(
+                                    wantedDrops,
+                                    availableDrops);
+
+                            if (dropCount != 0u)
+                            {
+                                for (uint64_t i = 0u;
+                                     i < dropCount;
+                                     ++i)
+                                {
+                                    playback.decodedFrames.pop_front();
+                                }
+
+                                playback.boot175DroppedFrames +=
+                                    dropCount;
+
+                                // The replacement source picture must occupy
+                                // the SAME presentation slot. Re-anchor its PTS
+                                // to this slot so presentationTickForFrame()
+                                // does not reintroduce the time we just
+                                // recovered on the next invocation.
+                                const MpegDecodedFrame &selectedFrame =
+                                    playback.decodedFrames.front();
+
+                                if (selectedFrame.pts90k >= 0)
+                                {
+                                    playback.firstPresentedPts90k =
+                                        selectedFrame.pts90k;
+
+                                    playback.ptsPresentationBaseTickQ32 =
+                                        presentationTargetQ32;
+                                }
+                                else
+                                {
+                                    playback.firstPresentedPts90k = -1;
+                                    playback.ptsPresentationBaseTickQ32 = 0u;
+                                }
+
+                                playback.nextPictureTickQ32 =
+                                    presentationTargetQ32;
+
+                                frameIntervalQ32 =
+                                    decodedFrameIntervalQ32(
+                                        playback,
+                                        selectedFrame);
+
+                                static uint32_t
+                                    s_boot175DropLogCount = 0u;
+
+                                if (s_boot175DropLogCount < 256u)
+                                {
+                                    std::cerr
+                                        << "[dothack:boot175-av-sync]"
+                                        << " stage=drop"
+                                        << " n="
+                                        << s_boot175DropLogCount++
+                                        << " drop="
+                                        << dropCount
+                                        << " totalDropped="
+                                        << playback.boot175DroppedFrames
+                                        << " served="
+                                        << playback.picturesServed
+                                        << " sourceProgress="
+                                        << (static_cast<uint64_t>(
+                                                playback.picturesServed) +
+                                            playback.boot175DroppedFrames)
+                                        << " expected="
+                                        << expectedSourceProgress
+                                        << " audio="
+                                        << boot175MovieAudioSeconds
+                                        << " audioProgress="
+                                        << audioProgressSeconds
+                                        << " frameSeconds="
+                                        << frameSeconds
+                                        << " queued="
+                                        << playback.decodedFrames.size()
+                                        << std::endl;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 frame = std::move(playback.decodedFrames.front());
                 playback.decodedFrames.pop_front();
                 playback.width = static_cast<uint32_t>(frame.width);
@@ -3574,6 +3924,109 @@ namespace ps2_stubs
                 height = playback.height;
                 frameCount = playback.picturesServed;
                 playback.picturesServed += 1u;
+                // BOOT 175:
+                // The first picture handed to the guest after physical
+                // audio playback begins defines the producer-side baseline.
+                // Any existing movie preroll therefore remains intact.
+                if (!playback.boot175HostClockArmed &&
+                    boot175MovieAudioSeconds >= 0.0)
+                {
+                    playback.boot175HostClockArmed = true;
+                    playback.boot175HostClockBaseSeconds =
+                        boot175MovieAudioSeconds;
+                    playback.boot175HostClockBaseSourceProgress =
+                        static_cast<uint64_t>(
+                            playback.picturesServed) +
+                        playback.boot175DroppedFrames;
+
+                    const uint64_t nominalIntervalQ32 =
+                        playback.pictureIntervalQ32 != 0u
+                            ? playback.pictureIntervalQ32
+                            : kDefaultPictureIntervalQ32;
+
+                    const double frameSeconds =
+                        (static_cast<double>(nominalIntervalQ32) /
+                         static_cast<double>(kPictureClockOne)) *
+                        (1001.0 / 60000.0);
+
+                    std::cerr
+                        << "[dothack:boot175-av-sync]"
+                        << " stage=armed"
+                        << " served="
+                        << playback.picturesServed
+                        << " dropped="
+                        << playback.boot175DroppedFrames
+                        << " sourceBase="
+                        << playback.boot175HostClockBaseSourceProgress
+                        << " audioBase="
+                        << playback.boot175HostClockBaseSeconds
+                        << " frameSeconds="
+                        << frameSeconds
+                        << " nominalFps="
+                        << (frameSeconds > 0.0
+                                ? 1.0 / frameSeconds
+                                : 0.0)
+                        << std::endl;
+                }
+
+                // Low-volume progress diagnostics. These are deliberately
+                // sparse so the probe does not recreate Boot 174's
+                // line-by-line timing overhead.
+                if (playback.boot175HostClockArmed &&
+                    boot175MovieAudioSeconds >=
+                        playback.boot175HostClockBaseSeconds &&
+                    playback.picturesServed != 0u &&
+                    (playback.picturesServed % 300u) == 0u)
+                {
+                    const uint64_t nominalIntervalQ32 =
+                        playback.pictureIntervalQ32 != 0u
+                            ? playback.pictureIntervalQ32
+                            : kDefaultPictureIntervalQ32;
+
+                    const double frameSeconds =
+                        (static_cast<double>(nominalIntervalQ32) /
+                         static_cast<double>(kPictureClockOne)) *
+                        (1001.0 / 60000.0);
+
+                    const uint64_t sourceProgress =
+                        static_cast<uint64_t>(
+                            playback.picturesServed) +
+                        playback.boot175DroppedFrames;
+
+                    const uint64_t sourceAdvance =
+                        sourceProgress >=
+                                playback.boot175HostClockBaseSourceProgress
+                            ? sourceProgress -
+                                  playback.boot175HostClockBaseSourceProgress
+                            : 0u;
+
+                    const double videoProgressSeconds =
+                        static_cast<double>(sourceAdvance) *
+                        frameSeconds;
+
+                    const double audioProgressSeconds =
+                        boot175MovieAudioSeconds -
+                        playback.boot175HostClockBaseSeconds;
+
+                    std::cerr
+                        << "[dothack:boot175-av-sync]"
+                        << " stage=sample"
+                        << " served="
+                        << playback.picturesServed
+                        << " dropped="
+                        << playback.boot175DroppedFrames
+                        << " sourceProgress="
+                        << sourceProgress
+                        << " audioProgress="
+                        << audioProgressSeconds
+                        << " videoProgress="
+                        << videoProgressSeconds
+                        << " drift="
+                        << (audioProgressSeconds -
+                            videoProgressSeconds)
+                        << std::endl;
+                }
+
                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
                 haveFrame = true;
@@ -3664,6 +4117,13 @@ namespace ps2_stubs
         (void)rdram;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
 
+        // BOOT 175:
+        // Capture host audio time outside the MPEG mutex.
+        const double boot175MovieAudioSeconds =
+            runtime != nullptr
+                ? runtime->audioBackend().movieAudioElapsedSeconds()
+                : -1.0;
+
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -3721,6 +4181,68 @@ namespace ps2_stubs
         const bool fallbackEnd =
             !producerEnded &&
             decoderComplete;
+
+        // BOOT 175:
+        // One final low-volume synchronization summary.
+        if ((normalEnd || fallbackEnd) &&
+            playback.boot175HostClockArmed &&
+            !playback.boot175FinalSyncLogged)
+        {
+            playback.boot175FinalSyncLogged = true;
+
+            const uint64_t nominalIntervalQ32 =
+                playback.pictureIntervalQ32 != 0u
+                    ? playback.pictureIntervalQ32
+                    : kDefaultPictureIntervalQ32;
+
+            const double frameSeconds =
+                (static_cast<double>(nominalIntervalQ32) /
+                 static_cast<double>(kPictureClockOne)) *
+                (1001.0 / 60000.0);
+
+            const uint64_t sourceProgress =
+                static_cast<uint64_t>(
+                    playback.picturesServed) +
+                playback.boot175DroppedFrames;
+
+            const uint64_t sourceAdvance =
+                sourceProgress >=
+                        playback.boot175HostClockBaseSourceProgress
+                    ? sourceProgress -
+                          playback.boot175HostClockBaseSourceProgress
+                    : 0u;
+
+            const double videoProgressSeconds =
+                static_cast<double>(sourceAdvance) *
+                frameSeconds;
+
+            const double audioProgressSeconds =
+                boot175MovieAudioSeconds >=
+                        playback.boot175HostClockBaseSeconds
+                    ? boot175MovieAudioSeconds -
+                          playback.boot175HostClockBaseSeconds
+                    : 0.0;
+
+            std::cerr
+                << "[dothack:boot175-av-sync]"
+                << " stage=final"
+                << " served="
+                << playback.picturesServed
+                << " dropped="
+                << playback.boot175DroppedFrames
+                << " sourceProgress="
+                << sourceProgress
+                << " audioProgress="
+                << audioProgressSeconds
+                << " videoProgress="
+                << videoProgressSeconds
+                << " drift="
+                << (audioProgressSeconds -
+                    videoProgressSeconds)
+                << " frameSeconds="
+                << frameSeconds
+                << std::endl;
+        }
 
         setReturnS32(ctx, (normalEnd || fallbackEnd) ? 1 : 0);
     }

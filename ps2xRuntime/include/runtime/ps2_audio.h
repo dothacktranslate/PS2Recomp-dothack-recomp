@@ -23,9 +23,26 @@ public:
                             uint32_t srcAddr,
                             uint32_t sizeBytes);
 
+    // BOOT 170:
+    // Feed a complete host-resident PSS PCM payload through the
+    // proven Boot 162-166 parser without temporary guest memory.
+    void onMoviePcmTransferFromBuffer(
+        const uint8_t *data,
+        uint32_t sizeBytes);
+
     // BOOT 165: periodically refill the host PSS AudioStream after
     // the initial MPEG demux burst has filled the PCM queue.
     void pumpMovieAudio();
+
+    // BOOT 172:
+    // Begin a prefilled PSS host stream when the guest actually
+    // enables movie presentation via startDisplay().
+    void startMovieAudioForDisplay();
+
+    // BOOT 175:
+    // Real host-time clock beginning at the exact transition that
+    // starts physical PSS audio playback. Returns -1 until active.
+    double movieAudioElapsedSeconds();
 
     void onSoundCommand(uint32_t sid, uint32_t rpcNum,
                         const uint8_t *sendBuf, uint32_t sendSize,

@@ -25,7 +25,10 @@ namespace ps2_stubs
     // stream stop/restart. Returns `size` while a CD stream is active (routed or
     // staged), 0 only when no CD stream is active. Thread-safe; stream callbacks are
     // not dispatched on this path.
-    size_t feedMpegCdStreamBytes(const uint8_t *data, size_t size);
+    size_t feedMpegCdStreamBytes(
+        const uint8_t *data,
+        size_t size,
+        PS2Runtime *runtime = nullptr);
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

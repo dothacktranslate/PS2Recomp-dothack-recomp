@@ -929,6 +929,180 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 
+
+    // BOOT 167: bounded live PSS refill state.
+    //
+    // The existing .hack host bridge feeds at most 4 MiB at sceCdStStart().
+    // That is ideal for startup/predecoder staging, but OPENING.PSS is much
+    // larger.  Preserve the startup feed, then remember where it ended so
+    // the live MPEG presentation path can request small subsequent chunks.
+    struct DothackHostPssRefillState
+    {
+        bool active = false;
+        uint32_t fileBaseLbn = 0u;
+        uint64_t nextByteOffset = 0u;
+        uint64_t fileSizeBytes = 0u;
+        uint32_t refillCount = 0u;
+    };
+
+    DothackHostPssRefillState g_dothackHostPssRefillState;
+
+    size_t refillDothackHostPssStream(
+        PS2Runtime *runtime,
+        size_t maxBytes)
+    {
+        auto &state = g_dothackHostPssRefillState;
+
+        if (!state.active || maxBytes == 0u)
+        {
+            return 0u;
+        }
+
+        if (state.nextByteOffset >= state.fileSizeBytes)
+        {
+            state.active = false;
+            return 0u;
+        }
+
+        const uint64_t remaining =
+            state.fileSizeBytes - state.nextByteOffset;
+
+        size_t byteCount =
+            static_cast<size_t>(
+                std::min<uint64_t>(
+                    remaining,
+                    static_cast<uint64_t>(maxBytes)));
+
+        // Every non-final refill remains sector aligned so the next
+        // request can resume directly at the following CD sector.
+        if (static_cast<uint64_t>(byteCount) < remaining)
+        {
+            byteCount =
+                (byteCount / kCdSectorSize) *
+                kCdSectorSize;
+        }
+
+        if (byteCount == 0u)
+        {
+            return 0u;
+        }
+
+        if ((state.nextByteOffset % kCdSectorSize) != 0u)
+        {
+            std::cerr
+                << "[dothack:boot167-refill]"
+                << " stage=unaligned-offset"
+                << " offset=0x" << std::hex
+                << state.nextByteOffset
+                << std::dec
+                << std::endl;
+
+            state.active = false;
+            return 0u;
+        }
+
+        const uint32_t lbn =
+            state.fileBaseLbn +
+            static_cast<uint32_t>(
+                state.nextByteOffset /
+                kCdSectorSize);
+
+        const uint32_t sectorCount =
+            static_cast<uint32_t>(
+                (byteCount + kCdSectorSize - 1u) /
+                kCdSectorSize);
+
+        std::vector<uint8_t> bytes(byteCount);
+
+        if (!readCdSectors(
+                lbn,
+                sectorCount,
+                bytes.data(),
+                bytes.size()))
+        {
+            std::cerr
+                << "[dothack:boot167-refill]"
+                << " stage=read-failed"
+                << " n=" << state.refillCount
+                << " lbn=0x" << std::hex << lbn
+                << " offset=0x" << state.nextByteOffset
+                << " bytes=0x" << byteCount
+                << std::dec
+                << std::endl;
+
+            return 0u;
+        }
+
+        const uint64_t oldOffset =
+            state.nextByteOffset;
+
+        const size_t accepted =
+            feedMpegCdStreamBytes(
+                bytes.data(),
+                bytes.size(),
+                runtime);
+
+        if (accepted != 0u)
+        {
+            state.nextByteOffset +=
+                static_cast<uint64_t>(accepted);
+        }
+
+        const uint64_t after =
+            state.nextByteOffset;
+
+        const uint64_t bytesRemaining =
+            after < state.fileSizeBytes
+                ? state.fileSizeBytes - after
+                : 0u;
+
+        std::cerr
+            << "[dothack:boot167-refill]"
+            << " stage=feed"
+            << " n=" << state.refillCount++
+            << " lbn=0x" << std::hex << lbn
+            << " offset=0x" << oldOffset
+            << " requested=0x" << byteCount
+            << " accepted=0x" << accepted
+            << " next=0x" << after
+            << " remaining=0x" << bytesRemaining
+            << std::dec
+            << std::endl;
+
+        if (accepted != byteCount)
+        {
+            std::cerr
+                << "[dothack:boot167-refill]"
+                << " stage=partial-feed"
+                << " requested=" << byteCount
+                << " accepted=" << accepted
+                << std::endl;
+
+            return accepted;
+        }
+
+        if (state.nextByteOffset >=
+            state.fileSizeBytes)
+        {
+            state.active = false;
+
+            std::cerr
+                << "[dothack:boot167-refill]"
+                << " stage=producer-eof"
+                << " total=0x" << std::hex
+                << state.fileSizeBytes
+                << std::dec
+                << std::endl;
+
+            // All host PSS bytes have now entered the decoder.  This is
+            // producer EOF, not presentation EOF; decoded pictures can
+            // continue draining normally afterwards.
+            notifyMpegCdStreamEof(runtime);
+        }
+
+        return accepted;
+    }
+
     void sceCdStStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t lbn = getRegU32(ctx, 4);
@@ -946,6 +1120,11 @@ namespace ps2_stubs
         g_cdStReadTraceCount = 0u;
 
         notifyMpegCdStreamStart(runtime);
+
+        // BOOT 167: reset bounded refill state for the new stream.
+        g_dothackHostPssRefillState =
+            DothackHostPssRefillState{};
+
 
 // .hack//INFECTION diagnostic:
 // The opening movie is streamed by the IOP on real hardware, so the EE never
@@ -980,7 +1159,8 @@ namespace ps2_stubs
 
         if (byteOffset >= file.sizeBytes)
         {
-            break;
+    
+        break;
         }
 
         const uint64_t remainingBytes =
@@ -1021,7 +1201,8 @@ namespace ps2_stubs
         const size_t accepted =
             feedMpegCdStreamBytes(
                 pssBytes.data(),
-                pssBytes.size());
+                pssBytes.size(),
+                runtime);
 
         std::cerr
             << "[dothack:mpeg-host-feed]"
@@ -1031,6 +1212,47 @@ namespace ps2_stubs
             << " accepted=0x" << accepted
             << std::dec
             << std::endl;
+
+        // BOOT 167: remember where the startup feed ended.
+        //
+        // Small logo PSS files remain inactive because the initial feed
+        // already contains the whole file. OPENING.PSS remains armed.
+        if (accepted != 0u)
+        {
+            g_dothackHostPssRefillState.fileBaseLbn =
+                file.baseLbn;
+
+            g_dothackHostPssRefillState.nextByteOffset =
+                byteOffset +
+                static_cast<uint64_t>(accepted);
+
+            g_dothackHostPssRefillState.fileSizeBytes =
+                static_cast<uint64_t>(file.sizeBytes);
+
+            g_dothackHostPssRefillState.active =
+                g_dothackHostPssRefillState.nextByteOffset <
+                g_dothackHostPssRefillState.fileSizeBytes;
+
+            std::cerr
+                << "[dothack:boot167-refill]"
+                << " stage=armed"
+                << " active="
+                << (
+                    g_dothackHostPssRefillState.active
+                        ? 1
+                        : 0
+                )
+                << " baseLbn=0x"
+                << std::hex
+                << g_dothackHostPssRefillState.fileBaseLbn
+                << " next=0x"
+                << g_dothackHostPssRefillState.nextByteOffset
+                << " size=0x"
+                << g_dothackHostPssRefillState.fileSizeBytes
+                << std::dec
+                << std::endl;
+        }
+
 
         break;
     }

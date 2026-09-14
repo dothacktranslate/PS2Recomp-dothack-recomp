@@ -3,6 +3,7 @@
 #include "ps2_host_backend.h"
 #include <cstring>
 #include <cstdio>
+#include <chrono>
 #include <vector>
 
 namespace
@@ -116,6 +117,14 @@ struct PS2AudioBackend::Impl
 
     uint64_t boot162MovieBytesReceived = 0u;
     uint64_t boot162MovieFramesSubmitted = 0u;
+
+    // BOOT 175:
+    // Wall-clock epoch for A/V synchronization. This is deliberately
+    // armed by startMovieAudioForDisplay(), not by stream creation or
+    // prefill, so t=0 remains the exact proven Boot 172 display/audio
+    // transition.
+    bool boot175MovieClockStarted = false;
+    std::chrono::steady_clock::time_point boot175MovieClockStart{};
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -423,7 +432,7 @@ void PS2AudioBackend::onMoviePcmTransfer(const uint8_t *rdram,
     // replacement and zero-fills unused frames.  Keep our submitted
     // frame count identical to the explicitly requested stream
     // half-buffer size so no artificial silence is inserted.
-    constexpr size_t kFramesPerUpdate = 4096u;
+    constexpr size_t kFramesPerUpdate = 16384u;
     constexpr size_t kSamplesPerFrame = 2u;
     constexpr size_t kSamplesPerUpdate =
         kFramesPerUpdate * kSamplesPerFrame;
@@ -438,7 +447,7 @@ void PS2AudioBackend::onMoviePcmTransfer(const uint8_t *rdram,
         // The current host reports a total device period footprint of
         // 3600 frames.  A requested 4096-frame half-buffer is therefore
         // above the individual period-size floor on this host.
-        constexpr int kBoot166MovieBufferFrames = 4096;
+        constexpr int kBoot166MovieBufferFrames = 16384;
 
         SetAudioStreamBufferSizeDefault(
             kBoot166MovieBufferFrames);
@@ -495,18 +504,10 @@ void PS2AudioBackend::onMoviePcmTransfer(const uint8_t *rdram,
         st.boot162MovieFramesSubmitted +=
             kFramesPerUpdate;
 
-        if (!st.boot162MovieStreamStarted)
-        {
-            PlayAudioStream(
-                st.boot162MovieStream);
-
-            st.boot162MovieStreamStarted = true;
-
-            std::fprintf(
-                stderr,
-                "[dothack:boot162-movie-audio] "
-                "stage=stream-start\n");
-        }
+        // BOOT 172: display-gated host PSS playback.
+        // Keep filling Raylib's exact-size buffers here, but do not
+        // start the physical audio device until the guest has actually
+        // enabled movie presentation through startDisplay().
 
         if (s_boot162SubmitLogCount < 64u)
         {
@@ -542,6 +543,102 @@ void PS2AudioBackend::onMoviePcmTransfer(const uint8_t *rdram,
 // opportunity to submit those samples.
 //
 // sceMpegGetPicture() now calls this once per movie presentation cycle.
+// BOOT 170:
+ // Reuse the exact working movie PCM parser for host-resident
+ // payload bytes. srcAddr zero makes data itself the byte base.
+void PS2AudioBackend::onMoviePcmTransferFromBuffer(
+    const uint8_t *data,
+    uint32_t sizeBytes)
+{
+    if (!data || sizeBytes == 0u)
+        return;
+
+    onMoviePcmTransfer(
+        data,
+        0u,
+        sizeBytes);
+}
+
+// BOOT 172:
+// Start the already-created and prefilled host movie stream at the
+// same guest-visible transition that enables video presentation.
+//
+// Parsing, PCM conversion and Raylib buffer filling are deliberately
+// allowed before this point. Only physical playback is gated.
+void PS2AudioBackend::startMovieAudioForDisplay()
+{
+#if defined(PLATFORM_VITA)
+    return;
+#else
+    if (!m_audioReady || !m_impl)
+        return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto &st = *m_impl;
+
+    if (!st.boot162MovieStreamLoaded ||
+        st.boot162MovieStreamStarted ||
+        st.boot162MovieFramesSubmitted == 0u)
+    {
+        return;
+    }
+
+    PlayAudioStream(st.boot162MovieStream);
+    st.boot162MovieStreamStarted = true;
+
+    // BOOT 175:
+    // Start the synchronization clock at exactly the same transition
+    // that starts the physical soundtrack.
+    st.boot175MovieClockStart =
+        std::chrono::steady_clock::now();
+    st.boot175MovieClockStarted = true;
+
+    std::fprintf(
+        stderr,
+        "[dothack:boot172-movie-audio] "
+        "stage=display-start "
+        "rate=%u "
+        "submittedFrames=%llu "
+        "pendingSamples=%zu\n",
+        st.boot162MovieSampleRate,
+        static_cast<unsigned long long>(
+            st.boot162MovieFramesSubmitted),
+        st.boot162MoviePcm.size());
+#endif
+}
+
+
+// BOOT 175:
+// Return elapsed real time since the PSS soundtrack began physical
+// playback.  The audio device runs at the source's real 48 kHz rate,
+// making this a stable master clock even when emulated VSync falls
+// behind real time.
+double PS2AudioBackend::movieAudioElapsedSeconds()
+{
+#if defined(PLATFORM_VITA)
+    return -1.0;
+#else
+    if (!m_audioReady || !m_impl)
+        return -1.0;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    const auto &st = *m_impl;
+
+    if (!st.boot162MovieStreamStarted ||
+        !st.boot175MovieClockStarted)
+    {
+        return -1.0;
+    }
+
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now() -
+               st.boot175MovieClockStart)
+        .count();
+#endif
+}
+
 void PS2AudioBackend::pumpMovieAudio()
 {
 #if defined(PLATFORM_VITA)
@@ -563,7 +660,7 @@ void PS2AudioBackend::pumpMovieAudio()
     // replacement and zero-fills unused frames.  Keep our submitted
     // frame count identical to the explicitly requested stream
     // half-buffer size so no artificial silence is inserted.
-    constexpr size_t kFramesPerUpdate = 4096u;
+    constexpr size_t kFramesPerUpdate = 16384u;
     constexpr size_t kSamplesPerFrame = 2u;
     constexpr size_t kSamplesPerUpdate =
         kFramesPerUpdate * kSamplesPerFrame;
